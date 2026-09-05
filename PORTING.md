@@ -416,7 +416,82 @@ comparison and a corpus containing a document long enough to trigger truncation.
 
 ---
 
-## 7. Definition of done
+## 7. Performance notes
+
+Correctness first — but once your port agrees, here is where the time actually goes and what
+is safe to optimize. Measured by instrumenting the Rust port with `rdtsc` region counters.
+
+**Where the cycles go** (generation, `n_layer=1`, `n_embd=16`, average context 3.5):
+
+| region | share | work (MACs) | cyc/op | verdict |
+|---|---:|---:|---:|---|
+| mlp (fc1 + relu + fc2) | 41% | 2144 | 1.38 | efficient |
+| qkv linear | 17% | 800 | 1.61 | efficient |
+| temp + softmax + sample | 14% | 135 | 6.8 | libm-bound (27 `exp` calls) |
+| attention | 12% | 112 | 7.9 | libm + indexing |
+| lm_head linear | 7% | 432 | 1.32 | efficient |
+| wo linear | 6% | 256 | 1.65 | efficient |
+| embed + rmsnorm | 3% | 48 | 3.75 | libm-bound (1 `pow`) |
+
+Two structural facts fall out of this:
+
+- **The `linear` kernels are already near the practical floor** at ~1.3–1.7 cycles per
+  multiply-accumulate. A 16-element dot product is a chain of 16 *dependent* f64 adds, and
+  add latency is ~4 cycles, so a single chain would cost 4 cyc/MAC. Landing at 1.4 means the
+  compiler is already interleaving several independent output rows to fill the pipeline. You
+  cannot do much better without reassociating, which the contract forbids.
+- **~20–30% of runtime is libm** — roughly 3 `pow` and 41 `exp` calls per token, all of them
+  mandated by the contract (`pow` in rmsnorm, `exp` in every softmax). That is a hard floor
+  unless the contract changes.
+
+**Three fixes that were worth 7.5% in Rust**, all verified bit-identical:
+
+| fix | gain | why |
+|---|---:|---|
+| Hoist the per-layer KV cache slices out of the inner loops | +4.0% | `cache[li][t*E+hs+j]` per element costs an outer bounds check, a pointer chase and an inner bounds check. Take the slice once, outside. |
+| `linear` over `out.iter_mut().zip(w.d.chunks_exact(cols))` | +3.7% | Removes the per-output-row slice and index bounds checks that `w.row(o)` / `out[o] = ..` incur. |
+| Hoist `pow(head_dim, 0.5)` to load time | +1.3% | It is a constant, and it was being recomputed once per layer per token. |
+
+The first two are specific to bounds-checked languages — the C++ port already used raw
+pointers in both places. The third was slack in *both* ports.
+
+**What does not work.** `-C target-cpu=native` / `-march=native` made things **slower**:
+−9.8% for Rust, −6.5% for C++, on this machine. The reduction cannot be vectorized without
+reassociation, so wider registers buy nothing while still costing setup and, on some parts,
+frequency. Measure before assuming.
+
+**Still on the table**, if you want to push further: flatten the KV cache from a
+vector-of-vectors to one flat allocation indexed by `li*block_size*E + t*E`; manually unroll
+`linear` across output rows to expose more instruction-level parallelism; skip the
+logits→probs copy in the scoring path.
+
+### Is any of this parallelizable?
+
+All three reference implementations are strictly single-threaded, and mostly must be:
+
+- **Within a token** the forward pass is a dependency chain (rmsnorm → qkv → attention → wo →
+  mlp → lm_head). The independent work — 16 to 64 output rows in a `linear` — is at
+  instruction level, not thread level. Spawning threads for 256 multiply-accumulates costs
+  far more than it saves.
+- **Across tokens in one sample:** impossible. Generation is autoregressive by definition.
+- **Across samples in generation:** the 1000 samples are independent, *but* one sequential RNG
+  stream runs through all of them. Parallelizing changes which tokens get sampled, so
+  `output_fnv1a64` changes. **Not contract-legal** as specified. Per-sample seeded RNGs would
+  fix that at the cost of a different golden hash.
+- **Across documents in perplexity: legal.** Each document is scored with a fresh KV cache
+  into a *local* accumulator, and those locals are then added in document order. Compute the
+  locals in parallel, reduce them in document order, and the result is bit-identical. This is
+  the one genuine thread-level opportunity in the whole program, worth close to linear
+  scaling on the perplexity throughput measurement.
+
+That last one is deliberately *not* implemented. The benchmark exists to compare single-core
+scalar performance across languages; a threaded perplexity path would measure core count
+instead. If you want it, add it behind an explicit `--threads N` flag so it cannot silently
+contaminate the cross-language comparison.
+
+---
+
+## 8. Definition of done
 
 ```bash
 python bench/run.py --build --check-only   # all implementations agree

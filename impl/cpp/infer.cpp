@@ -199,6 +199,7 @@ struct Layer {
 
 struct Model {
     int n_layer = 0, n_embd = 0, block_size = 0, n_head = 0, vocab_size = 0, head_dim = 0, bos = 0;
+    double attn_scale = 0.0;   // pow(head_dim, 0.5), computed once instead of per token
     std::string uchars;
     int char_to_id[256];
     Mat wte, wpe, lm_head;
@@ -233,6 +234,7 @@ struct Model {
         off += (8 - (off % 8)) % 8;
 
         head_dim = n_embd / n_head;
+        attn_scale = std::pow(double(head_dim), 0.5);   // identical value, hoisted
         bos = n_uchars;
         std::fill(std::begin(char_to_id), std::end(char_to_id), -1);
         for (int i = 0; i < n_uchars; ++i) char_to_id[uint8_t(uchars[i])] = i;
@@ -372,7 +374,7 @@ void forward(const Model& m, int token_id, int pos_id, Cache& c, Scratch& s) {
         std::memcpy(vcache + size_t(t_idx) * E, s.v.data(), size_t(E) * sizeof(double));
         const int T = t_idx + 1;
 
-        const double scale = std::pow(double(HD), 0.5);
+        const double scale = m.attn_scale;
         for (int h = 0; h < H; ++h) {
             const int hs = h * HD;
             for (int t = 0; t < T; ++t) {

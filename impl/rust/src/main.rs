@@ -167,6 +167,7 @@ struct Model {
     wpe: Mat,
     lm_head: Mat,
     layers: Vec<Layer>,
+    attn_scale: f64,
     num_weights: usize,
     weights_sum: f64,
     weights_abs_sum: f64,
@@ -256,6 +257,8 @@ impl Model {
             n_head,
             vocab_size,
             head_dim: n_embd / n_head,
+            // identical value to pow(head_dim, 0.5), just not recomputed per token
+            attn_scale: ((n_embd / n_head) as f64).powf(0.5),
             bos: n_uchars,
             uchars,
             char_to_id,
@@ -289,13 +292,18 @@ impl Model {
 // Operation order here is load-bearing: see BENCHMARK.md section 3.
 
 fn linear(x: &[f64], w: &Mat, out: &mut [f64]) {
-    for o in 0..w.rows {
-        let wo = w.row(o);
+    // The zip below silently truncates on a length mismatch, so assert the shapes
+    // instead of quietly computing a partial result. Compiled out in release.
+    debug_assert_eq!(out.len(), w.rows, "linear: out length must equal w.rows");
+    debug_assert_eq!(x.len(), w.cols, "linear: x length must equal w.cols");
+    // chunks_exact + iter_mut removes the per-output-row slice and index bounds
+    // checks that `w.row(o)` / `out[o] = ..` incur. Accumulation order is unchanged.
+    for (o, wo) in out.iter_mut().zip(w.d.chunks_exact(w.cols)) {
         let mut acc = 0.0f64;
         for (wi, xi) in wo.iter().zip(x.iter()) {
             acc += wi * xi;
         }
-        out[o] = acc;
+        *o = acc;
     }
 }
 
@@ -431,22 +439,29 @@ fn forward(m: &Model, token_id: usize, pos_id: usize, c: &mut Cache, s: &mut Scr
         c.keys[li][t_idx * e..(t_idx + 1) * e].copy_from_slice(&s.k);
         c.values[li][t_idx * e..(t_idx + 1) * e].copy_from_slice(&s.v);
 
-        let scale = (hd as f64).powf(0.5);
+        // OPT: hoist the per-layer cache slices. `c.values[li][..]` inside the inner
+        // loop costs an outer Vec bounds check plus a pointer chase plus an inner
+        // bounds check for every single element. The C++ port takes raw pointers here.
+        let kcache: &[f64] = &c.keys[li];
+        let vcache: &[f64] = &c.values[li];
+        let scale = m.attn_scale;
         for h in 0..m.n_head {
             let hs = h * hd;
+            let qh = &s.q[hs..hs + hd];
             for t in 0..t_len {
-                let kt = &c.keys[li][t * e + hs..t * e + hs + hd];
+                let kt = &kcache[t * e + hs..t * e + hs + hd];
                 let mut acc = 0.0f64;
-                for (a, b) in s.q[hs..hs + hd].iter().zip(kt.iter()) {
+                for (a, b) in qh.iter().zip(kt.iter()) {
                     acc += a * b;
                 }
                 s.attn_logits[t] = acc / scale;
             }
             softmax(&mut s.attn_logits[..t_len]);
+            let wgt = &s.attn_logits[..t_len];
             for j in 0..hd {
                 let mut acc = 0.0f64;
-                for t in 0..t_len {
-                    acc += s.attn_logits[t] * c.values[li][t * e + hs + j];
+                for (t, &wt) in wgt.iter().enumerate() {
+                    acc += wt * vcache[t * e + hs + j];
                 }
                 s.attn[hs + j] = acc;
             }

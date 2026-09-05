@@ -11,12 +11,15 @@ Core Ultra 7 155H (mobile, hybrid), pinned to CPU 0, best of 7 time-budgeted 1s 
 
 | impl | runtime | gen tok/s | speedup | perplexity | gen hash |
 |---|---|---:|---:|---:|---|
-| python | CPython 3.14.3 | ~4,590 | 1.0x | 10.789614873329409 | `0x6fa78e…dbcb` |
-| cpp | g++ 15.2.0 `-O3` | ~584,000 | **~127x** | 10.789614873329409 | `0x6fa78e…dbcb` |
-| rust | rustc 1.98.0 `--release` | ~567,000 | **~124x** | 10.789614873329409 | `0x6fa78e…dbcb` |
+| python | CPython 3.14.3 | ~4,530 | 1.0x | 10.789614873329409 | `0x6fa78e…dbcb` |
+| cpp | g++ 15.2.0 `-O3` | ~592,000 | **~131x** | 10.789614873329409 | `0x6fa78e…dbcb` |
+| rust | rustc 1.98.0 `--release` | ~600,000 | **~132x** | 10.789614873329409 | `0x6fa78e…dbcb` |
 
-C++ and Rust are within ~3% of each other - effectively tied, which is the expected result
-for the same scalar algorithm compiled by GCC and LLVM. Do not read the gap as meaningful.
+C++ and Rust are within a couple of percent of each other - effectively tied, which is the
+expected result for the same scalar algorithm compiled by GCC and LLVM. Do not read the
+remaining gap as meaningful; a paired 10-round comparison puts Rust +2.6% on gen and +0.6%
+on ppl, the latter a coin flip. See PORTING.md section 7 for the profiling that got here -
+Rust started 1.6% behind and three contract-legal fixes moved it 7.5%.
 
 Two corrections worth recording, since both inflated an earlier version of this table:
 
