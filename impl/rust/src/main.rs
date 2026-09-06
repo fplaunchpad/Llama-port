@@ -291,9 +291,8 @@ impl Model {
 // ----------------------------------------------------------------- kernels
 // Operation order here is load-bearing: see BENCHMARK.md section 3.
 
+#[cfg(feature = "unroll")]
 fn linear(x: &[f64], w: &Mat, out: &mut [f64]) {
-    // The zip below silently truncates on a length mismatch, so assert the shapes
-    // instead of quietly computing a partial result. Compiled out in release.
     debug_assert_eq!(out.len(), w.rows, "linear: out length must equal w.rows");
     debug_assert_eq!(x.len(), w.cols, "linear: x length must equal w.cols");
     // Four independent accumulators, so the CPU has four separate add chains to
@@ -332,6 +331,21 @@ fn linear(x: &[f64], w: &Mat, out: &mut [f64]) {
         }
         out[o] = acc;
         o += 1;
+    }
+}
+
+// The plain form: one accumulator, one output row at a time. chunks_exact + iter_mut
+// still removes the per-row bounds checks that `w.row(o)` / `out[o] = ..` would incur.
+#[cfg(not(feature = "unroll"))]
+fn linear(x: &[f64], w: &Mat, out: &mut [f64]) {
+    debug_assert_eq!(out.len(), w.rows, "linear: out length must equal w.rows");
+    debug_assert_eq!(x.len(), w.cols, "linear: x length must equal w.cols");
+    for (o, wo) in out.iter_mut().zip(w.d.chunks_exact(w.cols)) {
+        let mut acc = 0.0f64;
+        for (wi, xi) in wo.iter().zip(x.iter()) {
+            acc += wi * xi;
+        }
+        *o = acc;
     }
 }
 
@@ -818,7 +832,14 @@ fn run() -> Result<String, String> {
     j.strv("impl", "rust");
     j.strv("mode", &mode);
     j.strv("runtime", env!("MICROGPT_RUSTC"));
-    j.strv("build", "cargo --release (opt-level 3, no fast-math equivalent exists)");
+    j.strv(
+            "build",
+            if cfg!(feature = "unroll") {
+                "cargo --release (opt-level 3, unrolled linear)"
+            } else {
+                "cargo --release (opt-level 3, plain linear)"
+            },
+        );
     j.strv("weights_sha256", &m.sha256);
     j.strv("weights_path", &weights);
     j.strv("data_path", &data);

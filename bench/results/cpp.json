@@ -2,7 +2,7 @@
   "impl": "cpp",
   "mode": "check",
   "runtime": "g++ 15.2.0",
-  "build": "-O3 -std=c++20 -fno-fast-math -ffp-contract=off",
+  "build": "-O3 -std=c++20 -fno-fast-math -ffp-contract=off (unrolled)",
   "weights_sha256": "9bf6ac8636d6b4b4a24eededaca631086d617793f287e7e803437a5b2f7009b8",
   "weights_path": "D:\\projects\\llamaport\\weights\\microgpt.bin",
   "data_path": "D:\\projects\\llamaport\\data\\val.txt",
@@ -17,7 +17,7 @@
     "uchars": "abcdefghijklmnopqrstuvwxyz",
     "num_weights": 4192
   },
-  "load_seconds": 0.0005081002600491047,
+  "load_seconds": 0.00039689987897872925,
   "cpu_pin": "cpu0",
   "check": {
     "prompt": "emma",

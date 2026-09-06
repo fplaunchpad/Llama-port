@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
+[features]
+# The unrolled linear() is the shipped default. Build with --no-default-features to
+# get the plain form, so the benchmark can measure the optimization rather than
+# assert it. Both produce identical output; see OPTIMIZATIONS.md.
+default = ["unroll"]
+unroll = []
+
 [[bin]]
 name = "microgpt_infer"
 path = "src/main.rs"

@@ -12,7 +12,7 @@ optimization levels and timed inside a single Linux environment (WSL Debian), pi
 `taskset`, 11 interleaved rounds. Reproduce with:
 
 ```bash
-wsl -d Debian -- bash -c 'bash /mnt/d/projects/llamaport/tools/bench_wsl.sh'
+wsl -d Debian -- bash tools/bench_wsl.sh          # from the repo root
 ```
 
 ### Generation
@@ -45,7 +45,17 @@ The same picture on Windows for the three that run there natively (12 paired rou
 12/12. Absolute numbers differ between the two environments; the *ordering* agrees.
 
 **Ranking note.** Rust led C++ until the 4-way `linear` unroll was applied to both: that
-change is worth +21.6% to C++ and only +5.1% to Rust, so C++ moved ahead. See
+change is worth ~+21% to C++ and only ~+6% to Rust, so C++ moved ahead. Every optimization
+is a build switch, so the whole ladder can be re-measured:
+
+```bash
+wsl -d Debian -- bash tools/bench_variants.sh     # from the repo root
+```
+
+That produces a `<language>_<optimization>` matrix — 9 variants, all bit-identical, ranging
+from 6,805 tok/s (`python`) to 877,892 (`cpp_unroll`). It shows plainly that **optimization
+effort, not language choice, decided the ranking**: unoptimized Rust beats C++ at `-O2` and
+ties it at `-O3`, while fully optimized C++ leads by 16%. See
 [OPTIMIZATIONS.md](OPTIMIZATIONS.md).
 
 ### Correctness is portable; speed is not
@@ -357,6 +367,12 @@ Every implementation accepts the same flags, so `bench/run.py` can drive them un
 | `--repeats N` | `5` | timed repeats |
 | `--time-budget F` | `2.0` | wall-clock seconds per timed repeat |
 | `--pin N` | `0` | pin to this logical CPU (`-1` disables) |
+
+`--pin` is accepted by every implementation, but a port whose language has no affinity
+binding may report `"cpu_pin": "external (taskset)"` and rely on being pinned from outside
+instead. The OxCaml port does this, since OCaml's stdlib exposes no `sched_setaffinity`;
+`tools/bench_wsl.sh` and `tools/bench_variants.sh` pass `--pin -1` and use `taskset` for
+every implementation, so all of them get identical treatment.
 | `--max-docs N` | `0` (all) | truncate the perplexity set |
 | `--json PATH` | — | also write the report to this file |
 

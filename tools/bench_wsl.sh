@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Uniform benchmark: every implementation built and timed INSIDE one Linux environment.
 #
-#   wsl -d Debian -- bash -c 'bash /mnt/d/projects/llamaport/tools/bench_wsl.sh'
+#   wsl -d Debian -- bash tools/bench_wsl.sh     (run from the repo root;
+#   wsl.exe inherits the Windows working directory, so no absolute path is needed)
 #
 # Why this exists: the OxCaml port targets linux-x86_64 and cannot run natively on
 # Windows. Correctness is platform-independent - the same C++ source under g++ 15.2 /

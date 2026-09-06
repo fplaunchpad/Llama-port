@@ -34,6 +34,12 @@ def p(*parts):
     return os.path.join(ROOT, *parts)
 
 
+def to_wsl(path):
+    r"""D:\projects\x -> /mnt/d/projects/x, for a Linux binary invoked through wsl.exe."""
+    drive, rest = os.path.splitdrive(os.path.abspath(path))
+    return "/mnt/" + drive[0].lower() + rest.replace("\\", "/")
+
+
 IMPLS = {
     "python": dict(
         label="Python",
@@ -69,6 +75,27 @@ IMPLS = {
         missing="not built yet - run with --build (needs impl/rust/src/main.rs)",
         src=p("impl", "rust", "src", "main.rs"),
     ),
+    # OxCaml targets linux-x86_64, so on Windows it runs through WSL. Correctness is
+    # platform-independent (verified: identical output under Windows UCRT and Linux
+    # glibc), so the agreement gate covers it here - but a WSL binary timed against
+    # Windows-native ones would measure the OS, so it is excluded from the speed table.
+    # Use tools/bench_wsl.sh for its timings.
+    "oxcaml": dict(
+        label="OxCaml",
+        run=(["wsl.exe", "-d", "Debian", "--",
+              to_wsl(p("impl", "oxcaml", "build", "microgpt_infer"))]
+             if os.name == "nt" else [p("impl", "oxcaml", "build", "microgpt_infer")]),
+        path_map=to_wsl if os.name == "nt" else None,
+        correctness_only=os.name == "nt",
+        build=["wsl.exe", "-d", "Debian", "--", "bash",
+               to_wsl(p("impl", "oxcaml", "build.sh"))] if os.name == "nt"
+              else ["bash", p("impl", "oxcaml", "build.sh")],
+        build_needs=lambda: os.name != "nt" or shutil.which("wsl.exe") is not None,
+        build_missing="wsl.exe not on PATH - OxCaml needs Linux",
+        probe=lambda: os.path.exists(p("impl", "oxcaml", "build", "microgpt_infer")),
+        missing="not built yet - run with --build (needs WSL + the OxCaml opam switch)",
+        src=p("impl", "oxcaml", "main.ml"),
+    ),
 }
 
 
@@ -94,9 +121,10 @@ def build(name, spec, verbose):
 
 def run_one_mode(name, spec, args, mode):
     out_json = os.path.join(RESULTS, f"{name}.{mode}.json")
+    xlate = spec.get("path_map") or (lambda x: x)
     cmd = list(spec["run"]) + [
-        "--weights", p("weights", "microgpt.bin"),
-        "--data", p("data", args.data),
+        "--weights", xlate(p("weights", "microgpt.bin")),
+        "--data", xlate(p("data", args.data)),
         "--mode", mode,
         "--samples", str(args.samples),
         "--temperature", str(args.temperature),
@@ -105,7 +133,7 @@ def run_one_mode(name, spec, args, mode):
         "--max-docs", str(args.max_docs),
         "--time-budget", str(args.time_budget),
         "--pin", str(args.pin),
-        "--json", out_json,
+        "--json", xlate(out_json),
     ]
     # Give the timed process the best shot at an uncontended core. This machine
     # showed 2-3x swings between repeats without it.
@@ -331,14 +359,16 @@ def main():
         print("\nall implementations agree within tolerance")
 
     if not args.check_only:
-        base_gen = next((r["gen"]["tokens_per_sec_best"] for _, r in reports if "gen" in r), None)
-        base_ppl = next((r["ppl"]["tokens_per_sec_best"] for _, r in reports if "ppl" in r), None)
+        timed = [(n, r) for n, r in reports if not IMPLS[n].get("correctness_only")]
+        untimed = [n for n, _ in reports if IMPLS[n].get("correctness_only")]
+        base_gen = next((r["gen"]["tokens_per_sec_best"] for _, r in timed if "gen" in r), None)
+        base_ppl = next((r["ppl"]["tokens_per_sec_best"] for _, r in timed if "ppl" in r), None)
         print("\n" + "=" * 100)
         print(f"SPEED  (tok/s = forward passes per second, best of {args.repeats} "
               f"time-budgeted {args.time_budget}s repeats; higher is better)")
         print("=" * 100)
         rows, noisy = [], []
-        for n, r in reports:
+        for n, r in timed:
             g, pp = r.get("gen"), r.get("ppl")
             sp = max([s for s in (spread(g), spread(pp)) if s is not None], default=None)
             if sp is not None and sp > NOISE_THRESHOLD:

@@ -38,6 +38,20 @@ IMPLS = {
     "rust": [os.path.join(ROOT, "impl", "rust", "target", "release", "microgpt_infer" + EXE)],
 }
 
+def _to_wsl(path):
+    drive, rest = os.path.splitdrive(os.path.abspath(path))
+    return "/mnt/" + drive[0].lower() + rest.replace("\\", "/")
+
+# OxCaml is linux-only; on Windows it runs through WSL. It matters most here, because
+# this sweep is what exercises the multi-layer weight-loading path.
+_OX = os.path.join(ROOT, "impl", "oxcaml", "build", "microgpt_infer")
+if os.path.exists(_OX):
+    IMPLS["oxcaml"] = (["wsl.exe", "-d", "Debian", "--", _to_wsl(_OX)]
+                       if os.name == "nt" else [_OX])
+    _WSL_IMPLS = {"oxcaml"} if os.name == "nt" else set()
+else:
+    _WSL_IMPLS = set()
+
 
 def run(cmd, **kw):
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, **kw)
@@ -51,7 +65,7 @@ def main():
     args = ap.parse_args()
 
     available = {n: c for n, c in IMPLS.items()
-                 if n == "python" or os.path.exists(c[0])}
+                 if n == "python" or n in _WSL_IMPLS or os.path.exists(c[0])}
     missing = [n for n in IMPLS if n not in available]
     if missing:
         print(f"note: skipping unbuilt implementations: {', '.join(missing)}\n")
@@ -84,7 +98,8 @@ def main():
 
             results = {}
             for name, base in available.items():
-                proc = run(base + ["--weights", weights, "--data", data, "--mode", "all",
+                xl = _to_wsl if name in _WSL_IMPLS else (lambda x: x)
+                proc = run(base + ["--weights", xl(weights), "--data", xl(data), "--mode", "all",
                                    "--samples", str(args.samples), "--repeats", "1",
                                    "--time-budget", "0.05", "--max-docs", str(args.max_docs)])
                 if proc.returncode != 0:

@@ -17,6 +17,59 @@ Measure a change with:
 python tools/track_opt.py old=path/to/before.exe new=path/to/after.exe --rounds 15
 ```
 
+Or re-measure **every** optimization of **every** port in one interleaved run:
+
+```bash
+wsl -d Debian -- bash tools/bench_variants.sh     # from the repo root
+```
+
+Each optimization is a real build switch, not a patch applied by hand — `-DMG_UNROLL=0`
+for C++, `--no-default-features` for Rust, `MG_UNROLL=0` / `OCAMLFLAGS` for OxCaml — so
+the numbers below can be reproduced instead of taken on trust.
+
+---
+
+## The measured matrix
+
+9 variants, 11 interleaved rounds, `taskset`-pinned, one Linux environment. All nine
+produce byte-identical output, so every difference is real work saved.
+
+| variant | tok/s (median) | vs python | vs fastest |
+|---|---:|---:|---:|
+| `cpp_unroll` **(shipped)** | 877,892 | 129x | 100% |
+| `rust_unroll` **(shipped)** | 759,910 | 112x | 87% |
+| `cpp_plain` | 709,273 | 104x | 81% |
+| `rust_plain` | 689,804 | 101x | 79% |
+| `cpp_O2_plain` | 612,057 | 90x | 70% |
+| `oxcaml_unsafe_unroll` **(shipped)** | 478,996 | 70x | 55% |
+| `oxcaml_unsafe_plain` | 305,831 | 45x | 35% |
+| `oxcaml_safe_plain` | 184,437 | 27x | 21% |
+| `python` | 6,805 | 1.0x | 1% |
+
+Each step against the one before it, paired over the same rounds:
+
+| language | step | delta | rounds won |
+|---|---|---:|---|
+| **C++** | `-O2` → `-O3` | **+16.3%** | 11/11 |
+| | `-O3` → 4-way unroll | **+21.7%** | 11/11 |
+| | *total* | **+43.4%** | |
+| **Rust** | plain → 4-way unroll | **+6.7%** | 11/11 |
+| | *total* | **+10.2%** | |
+| **OxCaml** | bounds-checked → `-unsafe` | **+61.5%** | 11/11 |
+| | `-unsafe` → 4-way unroll | **+57.5%** | 11/11 |
+| | *total* | **+159.7%** | |
+
+Two things worth pulling out of that table:
+
+**Optimization effort decided the ranking, not the language.** Unoptimized, Rust (689,804)
+beats C++ at `-O2` (612,057) and is within 3% of C++ at `-O3`. Fully optimized, C++ leads by
+16%. Anyone benchmarking these two languages by writing the obvious loop and picking a flag
+would have got whichever answer their flag chose for them.
+
+**The slowest starting point had the most to gain.** OxCaml begins last at 27x Python and
+ends at 70x — the same two optimizations that bought C++ 43% bought OCaml 160%, because its
+backend was leaving far more on the table.
+
 ---
 
 ## The most interesting result: unrolling, and what compilers actually do

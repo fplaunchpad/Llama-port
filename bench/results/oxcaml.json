@@ -1,11 +1,11 @@
 {
-  "impl": "rust",
+  "impl": "oxcaml",
   "mode": "check",
-  "runtime": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
-  "build": "cargo --release (opt-level 3, unrolled linear)",
+  "runtime": "OCaml 5.2.0+ox",
+  "build": "ocamlopt (flambda2, unrolled linear)",
   "weights_sha256": "9bf6ac8636d6b4b4a24eededaca631086d617793f287e7e803437a5b2f7009b8",
-  "weights_path": "D:\\projects\\llamaport\\weights\\microgpt.bin",
-  "data_path": "D:\\projects\\llamaport\\data\\val.txt",
+  "weights_path": "/mnt/d/projects/llamaport/weights/microgpt.bin",
+  "data_path": "/mnt/d/projects/llamaport/data/val.txt",
   "config": {
     "n_layer": 1,
     "n_embd": 16,
@@ -17,8 +17,8 @@
     "uchars": "abcdefghijklmnopqrstuvwxyz",
     "num_weights": 4192
   },
-  "load_seconds": 0.0002958,
-  "cpu_pin": "cpu0",
+  "load_seconds": 0.0027980804443359375,
+  "cpu_pin": "external (taskset)",
   "check": {
     "prompt": "emma",
     "logits_after_prompt": [

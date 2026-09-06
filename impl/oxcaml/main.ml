@@ -198,15 +198,23 @@ let load_model path =
   let wte = take vocab_size n_embd in
   let wpe = take block_size n_embd in
   let lm_head = take vocab_size n_embd in
+  (* Explicit loop rather than Array.init: `take` advances the weight-file cursor, and
+     the order in which Array.init applies its function is NOT specified by the manual.
+     It is ascending in today's stdlib - which is why the 2- and 3-layer shape sweeps
+     pass - but relying on that would make which tensor lands in which layer depend on
+     unspecified behaviour. *)
   let layers =
-    Array.init n_layer (fun _ ->
-        let wq = take n_embd n_embd in
-        let wk = take n_embd n_embd in
-        let wv = take n_embd n_embd in
-        let wo = take n_embd n_embd in
-        let fc1 = take (4 * n_embd) n_embd in
-        let fc2 = take n_embd (4 * n_embd) in
-        { wq; wk; wv; wo; fc1; fc2 })
+    let acc = ref [] in
+    for _ = 1 to n_layer do
+      let wq = take n_embd n_embd in
+      let wk = take n_embd n_embd in
+      let wv = take n_embd n_embd in
+      let wo = take n_embd n_embd in
+      let fc1 = take (4 * n_embd) n_embd in
+      let fc2 = take n_embd (4 * n_embd) in
+      acc := { wq; wk; wv; wo; fc1; fc2 } :: !acc
+    done;
+    Array.of_list (List.rev !acc)
   in
   if !cursor <> String.length blob then
     failwith "weight file has trailing bytes the model does not want";
@@ -608,7 +616,14 @@ let () =
          n3 := !n3 + score_doc m docs.(di) s c (Some nll3)
        done;
        let r = rng_make (Int64.of_int !seed) in
-       let draws = Array.init 4 (fun _ -> next_u64 r) in
+       (* explicit loop: next_u64 mutates the generator, so evaluation order matters *)
+       let draws =
+         let d = Array.make 4 0L in
+         for i = 0 to 3 do
+           d.(i) <- next_u64 r
+         done;
+         d
+       in
 
        jobj w "check";
        jstr w "prompt" prompt;

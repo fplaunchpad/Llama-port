@@ -42,8 +42,41 @@ python bench/run.py --build                    # build + verify + benchmark
 The full uniform benchmark, including OxCaml (which needs Linux):
 
 ```bash
-wsl -d Debian -- bash -c 'bash /mnt/d/projects/llamaport/tools/bench_wsl.sh'
+wsl -d Debian -- bash tools/bench_wsl.sh          # from the repo root
 ```
+
+And the optimization-wise matrix — every `<language>_<optimization>` variant, built from
+real build switches and timed together:
+
+```bash
+wsl -d Debian -- bash tools/bench_variants.sh     # from the repo root
+```
+
+## What you can actually reproduce
+
+The four ports need different toolchains, so here is the honest picture:
+
+| you have | you can run |
+|---|---|
+| **Python 3.12+ only** (no packages) | the reference port, the full correctness suite against it, the perplexity baselines, and training |
+| **+ a C++ compiler** | the C++ port and a real two-way speed comparison |
+| **+ Rust** (`rustup`) | the three-way comparison |
+| **+ OxCaml** (opam switch `5.2.0+ox`, Linux x86-64) | all four, and `tools/bench_variants.sh` |
+
+**OxCaml is the awkward one.** It is a Jane Street compiler variant installed through a
+dedicated opam switch and it targets linux-x86-64, so on Windows it needs WSL. If you do not
+have it, everything else still works — `bench/run.py` and `tools/test_shapes.py` skip any
+implementation they cannot find and tell you so, rather than failing.
+
+Nothing here needs a GPU, a network connection (after the first run downloads the corpus, and
+`input.txt` is committed so even that is optional), or any third-party library. Every port is
+dependency-free by design.
+
+Two notes on the numbers. Speed figures come from *this* machine (Core Ultra 7 155H, a mobile
+hybrid CPU) and will differ on yours; the **ratios** are the portable part. And correctness is
+platform-independent — verified by building the same C++ source under Windows UCRT and Linux
+glibc and getting bit-identical output — so the golden values in
+[PORTING.md](PORTING.md) should reproduce exactly for you even though the timings will not.
 
 ## Layout
 
@@ -56,6 +89,7 @@ wsl -d Debian -- bash -c 'bash /mnt/d/projects/llamaport/tools/bench_wsl.sh'
 | [impl/oxcaml/main.ml](impl/oxcaml/main.ml) | OCaml/OxCaml port, stdlib only (767 lines) |
 | [bench/run.py](bench/run.py) | harness: builds, runs, enforces agreement, prints the table |
 | [tools/bench_wsl.sh](tools/bench_wsl.sh) | uniform benchmark, everything in one Linux environment |
+| [tools/bench_variants.sh](tools/bench_variants.sh) | optimization-wise matrix, every variant of every port |
 | [tools/train_export.py](tools/train_export.py) | trains microgpt and exports the weight file |
 
 Every port is dependency-free on purpose — each hand-rolls its own SHA-256, RNG and JSON

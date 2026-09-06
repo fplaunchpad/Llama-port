@@ -1,0 +1,11 @@
+# Shell scripts run under WSL/Linux. If git checks them out with CRLF endings, bash
+# fails with "bad interpreter: /bin/bash^M", so pin them to LF regardless of the
+# cloner's core.autocrlf setting.
+*.sh text eol=lf
+
+# The weight file is binary - never translate line endings inside it, and do not try
+# to diff it as text.
+*.bin binary
+
+# Everything else: let git normalize to LF in the repository.
+* text=auto

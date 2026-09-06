@@ -288,6 +288,14 @@ struct Model {
 // --------------------------------------------------------------- kernels
 // Operation order here is load-bearing: see BENCHMARK.md section 3.
 
+// MG_UNROLL selects between the two shapes of the same arithmetic, so the benchmark
+// can measure the optimization rather than just assert it. Build with -DMG_UNROLL=0
+// for the plain form. Both produce identical output; see OPTIMIZATIONS.md.
+#ifndef MG_UNROLL
+#define MG_UNROLL 1
+#endif
+
+#if MG_UNROLL
 // Four independent accumulators, so the CPU has four separate add chains to overlap
 // rather than one serial chain of dependent f64 adds. Each row still accumulates
 // strictly left to right, so the arithmetic and its order are unchanged.
@@ -314,6 +322,16 @@ void linear(const double* x, const Mat& w, double* out) {
         out[o] = acc;
     }
 }
+#else
+void linear(const double* x, const Mat& w, double* out) {
+    for (int o = 0; o < w.rows; ++o) {
+        const double* wo = w.row(o);
+        double acc = 0.0;
+        for (int i = 0; i < w.cols; ++i) acc += wo[i] * x[i];
+        out[o] = acc;
+    }
+}
+#endif
 
 void rmsnorm(const double* x, int n, double* out) {
     double ms = 0.0;
@@ -484,10 +502,15 @@ struct Json {
     void arr(const std::string& k) { key(k); o << "["; first.push_back(true); }
     void end_arr() { o << "]"; first.pop_back(); }
 
-    void num(const std::string& k, double v) { key(k); o << v; }
+    // JSON has no inf/nan literals; emit null like the Rust and OCaml ports do.
+    // Unreachable on this checkpoint, but the three should not disagree on it.
+    void num(const std::string& k, double v) {
+        key(k);
+        if (std::isfinite(v)) o << v; else o << "null";
+    }
     void num(const std::string& k, long long v) { key(k); o << v; }
     void str(const std::string& k, const std::string& v) { key(k); o << quote(v); }
-    void val(double v) { comma(); o << v; }
+    void val(double v) { comma(); if (std::isfinite(v)) o << v; else o << "null"; }
     void val(long long v) { comma(); o << v; }
     void val(const std::string& v) { comma(); o << quote(v); }
 
@@ -599,7 +622,8 @@ int main(int argc, char** argv) {
 #endif
             j.str("runtime", rt.str());
         }
-        j.str("build", "-O3 -std=c++20 -fno-fast-math -ffp-contract=off");
+        j.str("build", MG_UNROLL ? "-O3 -std=c++20 -fno-fast-math -ffp-contract=off (unrolled)"
+                             : "-O3 -std=c++20 -fno-fast-math -ffp-contract=off (plain linear)");
         j.str("weights_sha256", m.sha256);
         j.str("weights_path", weights);
         j.str("data_path", data);
