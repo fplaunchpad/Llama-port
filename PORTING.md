@@ -398,12 +398,15 @@ measurement is broken — that disagreement is what exposed both timing bugs in 
 
 Do not read a green suite as proof of a perfect port.
 
-- **One platform per language.** g++ 15.2 (MSYS2 UCRT), rustc 1.98, CPython 3.14.3, all on
-  x86-64 Windows. A different libm may shift `exp`/`log`/`pow` by an ulp. The 1e-9 tolerance
-  absorbs that, but nothing here proves portability across platforms.
+- ~~One platform per language.~~ **Now tested.** The same C++ source built with g++ 15.2 on
+  Windows (UCRT libm) and g++ 14.2 on Linux (glibc libm) produces **bit-identical** output:
+  same perplexity to the last digit, same generated text, same checksums. The OxCaml port,
+  which only runs on Linux, agrees with all three. So cross-platform agreement holds in
+  practice on x86-64, at least for these two libm implementations. Cross-platform *timing*
+  remains meaningless — build and time everything in one environment.
 - **The `block_size` truncation branch is never exercised.** The longest name is 15
   characters, so `n = min(block_size, len(tokens)-1)` never actually truncates. A bug in that
-  branch is invisible in all three implementations.
+  branch is invisible in all four implementations.
 - **No fuzzing.** Agreement is verified on 4 fixed shapes and one corpus, not over random
   weights, random documents or random settings.
 - **NaN / Inf paths are unexercised.** Trap 4 was fixed by inspection, not by a test.
@@ -435,11 +438,14 @@ is safe to optimize. Measured by instrumenting the Rust port with `rdtsc` region
 
 Two structural facts fall out of this:
 
-- **The `linear` kernels are already near the practical floor** at ~1.3–1.7 cycles per
-  multiply-accumulate. A 16-element dot product is a chain of 16 *dependent* f64 adds, and
-  add latency is ~4 cycles, so a single chain would cost 4 cyc/MAC. Landing at 1.4 means the
-  compiler is already interleaving several independent output rows to fill the pipeline. You
-  cannot do much better without reassociating, which the contract forbids.
+- **The `linear` kernels look near the floor, but are not.** They run at ~1.3–1.7 cycles per
+  multiply-accumulate. A 16-element dot product is a chain of 16 *dependent* f64 adds at ~4
+  cycles of latency each, so a single chain would cost 4 cyc/MAC; landing at 1.4 means the
+  compiler is *partly* interleaving independent output rows. It turns out not to be doing
+  that fully: unrolling four output rows **by hand** is worth **+21.6% in C++, +5.1% in Rust
+  and +61% in OCaml**. An earlier version of this document claimed the compilers had already
+  extracted this and no more was available — that was wrong, and measuring it is what proved
+  it. See OPTIMIZATIONS.md.
 - **~20–30% of runtime is libm** — roughly 3 `pow` and 41 `exp` calls per token, all of them
   mandated by the contract (`pow` in rmsnorm, `exp` in every softmax). That is a hard floor
   unless the contract changes.

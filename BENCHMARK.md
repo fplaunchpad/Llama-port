@@ -1,51 +1,61 @@
 # microgpt port benchmark — contract
 
-Three implementations of the same inference algorithm — Python, C++, Rust — measured on
-**token generation speed** and **held-out perplexity**, loading **identical weights**.
+Four implementations of the same inference algorithm — Python, C++, Rust, OxCaml — measured
+on **token generation speed** and **held-out perplexity**, loading **identical weights**.
 
 Any port that follows this document can be dropped into `bench/run.py` and compared.
 
 ## Current results
 
-Core Ultra 7 155H (mobile, hybrid), pinned to CPU 0, best of 7 time-budgeted 1s repeats, one process per measurement:
+**The headline comparison is the uniform one:** all four implementations built with matched
+optimization levels and timed inside a single Linux environment (WSL Debian), pinned with
+`taskset`, 11 interleaved rounds. Reproduce with:
 
-| impl | runtime | gen tok/s | speedup | perplexity | gen hash |
-|---|---|---:|---:|---:|---|
-| python | CPython 3.14.3 | ~4,530 | 1.0x | 10.789614873329409 | `0x6fa78e…dbcb` |
-| cpp | g++ 15.2.0 `-O3` | ~592,000 | **~131x** | 10.789614873329409 | `0x6fa78e…dbcb` |
-| rust | rustc 1.98.0 `--release` | ~600,000 | **~132x** | 10.789614873329409 | `0x6fa78e…dbcb` |
+```bash
+wsl -d Debian -- bash -c 'bash /mnt/d/projects/llamaport/tools/bench_wsl.sh'
+```
 
-C++ and Rust are within a couple of percent of each other - effectively tied, which is the
-expected result for the same scalar algorithm compiled by GCC and LLVM. Do not read the
-remaining gap as meaningful; a paired 10-round comparison puts Rust +2.6% on gen and +0.6%
-on ppl, the latter a coin flip. See PORTING.md section 7 for the profiling that got here -
-Rust started 1.6% behind and three contract-legal fixes moved it 7.5%.
+### Generation
 
-Two corrections worth recording, since both inflated an earlier version of this table:
+| impl | runtime | tok/s (median) | vs Python | vs fastest |
+|---|---|---:|---:|---:|
+| cpp | g++ 14.2 `-O3` | 745,823 | **121x** | 100% |
+| rust | rustc 1.98.1 `--release` | 654,331 | **106x** | 88% |
+| oxcaml | ocamlopt 5.2.0+ox `-O3 -unsafe` | 320,632 | **52x** | 43% |
+| python | CPython 3.13.5 | 6,179 | 1.0x | 1% |
 
-- An earlier revision claimed C++ was ~142x. That was inflated because the Python reference
-  used CPython's compensated `sum()`, doing arithmetic the compiled ports never did. See the
-  `sum()` warning in section 3.
-- An earlier revision had C++ at `-O2` while Rust ran `opt-level 3`, which made Rust look
-  ~20% faster than C++. That was the flag, not the language. Both now build at O3.
+### Perplexity throughput
 
-Measure implementations in **short, isolated sessions**. Running all three through one
-`bench/run.py` invocation with high `--repeats` takes long enough that the machine loses
-clock across the session, and the numbers spread by 1.6x or more. The per-implementation
-figures above come from separate ~2s runs.
+| impl | tok/s (median) | vs Python |
+|---|---:|---:|
+| cpp | 757,756 | 115x |
+| rust | 676,181 | 103x |
+| oxcaml | 337,985 | 52x |
+| python | 6,566 | 1.0x |
 
-Identical weights, identical generated text, and **bit-identical perplexity** - not merely
-close: the same f64 down to the last digit, plus identical `weights_sum`.
+Perplexity itself is **10.789614873329409** for all four, bit-identical, as is the generated
+text (`0xae6c6ffbd8f5b02c`) and `weights_sum`.
 
-Note that within each implementation gen and ppl throughput agree to well under 2%. That is
-the sanity check that the timing is sound: both run the same forward pass, so they must. An
-earlier version of this harness reported gen and ppl differing by 1.5x, which turned out to
-be a measurement artifact, not a real difference - see section 5.
+Paired over 11 rounds: Rust −10.2% vs C++ on gen and −10.5% on ppl, losing 0/11 both times.
+OxCaml −56.3% / −55.4%. Within each implementation gen and ppl agree closely, which is the
+cross-check that the timing is sound — both run the same forward pass, so they must.
 
-Agreement is also verified across model shapes, not just this checkpoint
-(`python tools/test_shapes.py`): 1/2/3-layer, 8-embd to 32-embd, 1 to 8 heads, all matching
-exactly. The shipped checkpoint has `n_layer=1`, so without that sweep the transformer's
-per-layer indexing would never actually be exercised.
+The same picture on Windows for the three that run there natively (12 paired rounds,
+`python tools/track_opt.py`): C++ 883,446 tok/s, Rust 849,316, C++ ahead by 4.6% winning
+12/12. Absolute numbers differ between the two environments; the *ordering* agrees.
+
+**Ranking note.** Rust led C++ until the 4-way `linear` unroll was applied to both: that
+change is worth +21.6% to C++ and only +5.1% to Rust, so C++ moved ahead. See
+[OPTIMIZATIONS.md](OPTIMIZATIONS.md).
+
+### Correctness is portable; speed is not
+
+Verified here: the same C++ source under g++ 15.2 / Windows UCRT and g++ 14.2 / Linux glibc
+produces **bit-identical** output. So agreement can be chained across platforms — which is
+how the OxCaml port, which only builds for linux-x86_64, is confirmed identical to the other
+three. Timing cannot be chained that way: comparing a Windows-native binary against a WSL one
+measures the OS and libm, not the language, which is why `tools/bench_wsl.sh` builds and
+times everything in one place.
 
 Perplexity in context, all fit on the same 1,000 documents microgpt trained on
 (`python tools/baselines.py`):
@@ -56,6 +66,14 @@ Perplexity in context, all fit on the same 1,000 documents microgpt trained on
 | unigram (char frequency) | 2.8332 | 17.00 |
 | bigram (count table) | 2.5120 | 12.33 |
 | **microgpt (1,000 steps)** | **2.3786** | **10.79** |
+
+Agreement is also verified across model shapes, not just this checkpoint
+(`python tools/test_shapes.py`): 1/2/3-layer, 8-embd to 32-embd, 1 to 8 heads, all matching
+exactly. The shipped checkpoint has `n_layer=1`, so without that sweep the transformer's
+per-layer indexing would never actually be exercised.
+
+Measure in **short, isolated sessions**. A long benchmark run lets the machine lose clock
+across it, and numbers spread by 1.6x or more; `bench/run.py` warns when that happens.
 
 ---
 
@@ -75,7 +93,7 @@ python tools/train_export.py --steps 1000
 `tools/train_export.py` is a faithful copy of microgpt.py's math, RNG call order and
 optimizer, so it produces exactly the weights microgpt.py would hold when its own training
 loop ends. It then writes `weights/microgpt.bin`. **After that nothing ever trains again** —
-all three implementations are inference-only and just read that file.
+all four implementations are inference-only and just read that file.
 
 Current checkpoint: 1,000 steps, train loss 3.37 → 2.32, held-out perplexity 10.79
 (uniform baseline is 27.0).
@@ -124,7 +142,7 @@ layout bug, and everything downstream is meaningless.
 
 ## 3. Numerics contract
 
-All three implementations compute in **f64** and must apply operations in the same order, so
+All four implementations compute in **f64** and must apply operations in the same order, so
 that perplexity agrees to ~1e-12 rather than merely "close enough". Reproduce these exactly:
 
 ```
@@ -403,7 +421,7 @@ for each byte b: h ^= b; h = h * 0x100000001B3   // wrapping
 never from the time-budgeted ones, so they stay comparable across implementations.
 
 `check.first3_nll` must group its summation per document and then add, the same way the
-perplexity path does - all three implementations route it through their `score_doc` helper
+perplexity path does - all four implementations route it through their `score_doc` helper
 for exactly this reason. Folding every token into one running total is a different summation
 order and shifts the last digits, which reads as a cross-language mismatch when it is only
 the fingerprint disagreeing with itself.

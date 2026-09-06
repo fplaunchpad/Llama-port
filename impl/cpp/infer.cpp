@@ -288,8 +288,26 @@ struct Model {
 // --------------------------------------------------------------- kernels
 // Operation order here is load-bearing: see BENCHMARK.md section 3.
 
+// Four independent accumulators, so the CPU has four separate add chains to overlap
+// rather than one serial chain of dependent f64 adds. Each row still accumulates
+// strictly left to right, so the arithmetic and its order are unchanged.
+// Measured +21.6% here - GCC was not fully interleaving output rows on its own.
 void linear(const double* x, const Mat& w, double* out) {
-    for (int o = 0; o < w.rows; ++o) {
+    int o = 0;
+    for (; o + 4 <= w.rows; o += 4) {
+        const double* w0 = w.row(o);
+        const double* w1 = w.row(o + 1);
+        const double* w2 = w.row(o + 2);
+        const double* w3 = w.row(o + 3);
+        double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        for (int i = 0; i < w.cols; ++i) {
+            const double xi = x[i];
+            a0 += w0[i] * xi; a1 += w1[i] * xi;
+            a2 += w2[i] * xi; a3 += w3[i] * xi;
+        }
+        out[o] = a0; out[o + 1] = a1; out[o + 2] = a2; out[o + 3] = a3;
+    }
+    for (; o < w.rows; ++o) {
         const double* wo = w.row(o);
         double acc = 0.0;
         for (int i = 0; i < w.cols; ++i) acc += wo[i] * x[i];

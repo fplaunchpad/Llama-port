@@ -1,14 +1,17 @@
-# Optimization log — Rust port
+# Optimization log
 
-Generation speed after each change. Every measurement uses identical settings
-(`--mode gen --samples 200 --temperature 0.5 --seed 1234`) and every build is checked
-against the same output hash `0xae6c6ffbd8f5b02c`.
+Every optimization to every port, with before/after numbers.
 
-**A build that is faster but produces different text is a bug, not an optimization.** All
-five builds below produce byte-for-byte identical output, so the speed differences are real
-work saved, not corners cut.
+Two rules, applied without exception:
 
-Measure a new change with:
+1. **Identical output or it doesn't count.** Every build below produces byte-for-byte
+   identical generated text (hash `0xae6c6ffbd8f5b02c` at `--samples 200`) and bit-identical
+   perplexity. A build that is faster but produces different text is a bug, not an
+   optimization.
+2. **Whatever helps one language is tried on all of them.** Otherwise the benchmark measures
+   how much effort each port received, not the language.
+
+Measure a change with:
 
 ```bash
 python tools/track_opt.py old=path/to/before.exe new=path/to/after.exe --rounds 15
@@ -16,103 +19,129 @@ python tools/track_opt.py old=path/to/before.exe new=path/to/after.exe --rounds 
 
 ---
 
-## Results
+## The most interesting result: unrolling, and what compilers actually do
 
-Each row is **baseline plus that one change** — not a cumulative chain, so don't read row 2
-as "row 1 plus more". The last row is all three together, which is what shipped.
+The matrix multiply is a chain of *dependent* additions — each `acc += w*x` waits for the
+previous one, roughly 4 cycles apiece. The escape is to compute four output rows at once so
+the CPU has four independent chains to overlap. Each row still accumulates strictly left to
+right, so the arithmetic and its order are unchanged, and the output hash never moved.
 
-| build | tok/s (one session) | delta across 5 sessions | verdict |
+Doing this **by hand** is worth wildly different amounts:
+
+| language | gain from 4-way manual unroll | rounds won | what it says about the compiler |
 |---|---:|---|---|
-| baseline (first working port) | 541,908 | — | started 1.6% behind C++ |
-| baseline + **A** (KV cache hoist) | 543,364 | +0.5, +1.6, +2.0, +2.3, +4.0% | **real, ~+2%** |
-| baseline + **B** (chunked matrix walk) | 557,707 | +2.2, +2.9, +3.7, +4.0, +10.1% | **real, ~+3%** |
-| baseline + **C** (precomputed constant) | 535,227 | −1.8, −0.7, +0.2, +1.3, +2.6% | **no measurable effect** |
-| baseline + **A+B+C** (shipped) | 577,153 | +5.0, +5.6, +5.6, +7.5, +7.5% | **real, ~+6%** |
+| OCaml (OxCaml, flambda2) | **+61%** | 7/7 | not interleaving output rows at all |
+| C++ (g++ 14.2/15.2 `-O3`) | **+21.6%** | 9/9 | interleaving partially |
+| Rust (rustc 1.98 `--release`) | **+5.1%** | 8/9 | interleaving nearly fully |
 
-**Net effect:** Rust went from 1.6% behind C++ to 2.6% ahead of it on generation, measured
-paired over 10 rounds. Perplexity throughput is +0.6%, which is a coin flip — call the two
-languages tied.
+That spread is a direct measurement of how much instruction-level parallelism each backend
+was already extracting, and it is the single largest optimization in this project.
 
-### Why five sessions instead of one number
-
-This machine (mobile hybrid CPU) has 5–8% run-to-run spread, and absolute throughput drifted
-from ~600k to ~370k tok/s over one afternoon. Any single run can show a 3% effect that
-reverses on the next run — **C did exactly that**, measuring +1.3% once and −1.8% the next
-time. So each change was re-measured in five independent interleaved sessions, and is only
-called real when the sign held in all five. Trust the combined +6%; treat the individual
-attributions as ±3%.
+**I got this wrong first.** Earlier versions of these docs claimed GCC and LLVM already did
+this and that the kernels were "near the practical floor" — asserted from a cycles-per-op
+estimate, never measured. Testing it because OCaml needed it, then applying it to the others
+for fairness, is what exposed the error. It also **flipped the ranking**: Rust led C++ by
+2.6% before, and trails by ~4-10% after, because C++ had more headroom left.
 
 ---
 
-## What each change actually was
+## Rust
 
-### A — Don't re-find the shelf for every book
+| change | delta | verdict |
+|---|---|---|
+| **A** hoist KV cache slices out of attention inner loops | +0.5 … +4.0% over 5 sessions | real, ~+2% |
+| **B** walk `linear` in fixed-size chunks instead of by index | +2.2 … +10.1% over 5 sessions | real, ~+3% |
+| **C** precompute the constant attention scale | −1.8 … +2.6%, sign flips | **no measurable effect** |
+| A+B+C combined | +5.0 … +7.5% over 5 sessions | real, ~+6% |
+| **D** 4-way unrolled `linear` | +5.1%, 8/9 rounds | real |
 
-Attention reads from the KV cache, which was stored as a list of lists: `cache[layer][slot]`.
-Reading one number meant: check the layer number is valid, follow a pointer to that layer's
-array, check the slot is valid, then finally read. Four steps of bookkeeping for one number —
-and the layer never changes inside the loop.
+**A — don't re-find the shelf for every book.** The KV cache was a list of lists,
+`cache[layer][slot]`. Reading one number meant checking the layer index, following a pointer
+to that layer's array, checking the slot index, then reading — four steps of bookkeeping per
+number, for a layer that never changes inside the loop. Now the layer's array is taken once,
+before the loop. The C++ port never had this problem; it used a raw pointer from the start.
 
-The fix grabs the layer's array **once**, before the loop starts, then reads plain numbers
-out of it. Like fetching the right shelf once instead of walking back to the library
-catalogue for every book.
+**B — prove it's safe once, not sixty-four times.** Indexing output rows by number makes Rust
+insert a bounds check on every lookup and every write, 16–64 times per call, for indexes that
+cannot be out of range. Walking the weights in fixed-size chunks lets the compiler prove
+validity once, up front. (Superseded by D, which restructures the same loop again.)
 
-The C++ port never had this problem: it took a raw pointer to the layer's array from the
-start. This was Rust-specific catch-up.
+**C — stop recomputing a constant.** `√head_dim` was computed once per layer per token,
+always returning 2.0. Now computed at load. **No measurable speedup** — LLVM already rewrites
+`pow(x, 0.5)` as `sqrt`. Kept for clarity, not speed. Applied to C++ too, so neither language
+gets an unearned advantage.
 
-### B — Prove it's safe once, not sixty-four times
+---
 
-The matrix multiply walks output rows: "compute row 0, write row 0; compute row 1, write row
-1…". Written with explicit index numbers, Rust inserts a safety check on every single lookup
-and every single write, asking "is this index actually inside the array?" — 16 to 64 times
-per call, for indexes that obviously can't be out of range.
+## C++
 
-Rewriting the loop to walk the weights in fixed-size chunks and write through an iterator
-lets Rust prove the indexes are valid **once**, up front, and skip all the per-row checks.
-Identical arithmetic in identical order — just without re-proving safety on every step.
+| change | delta | verdict |
+|---|---|---|
+| precompute the constant attention scale | not separately measurable | parity with Rust's C |
+| **4-way unrolled `linear`** | **+21.6%**, 9/9 rounds | **real, and large** |
+| `-O2` → `-O3` | +20% | fixes an unfair comparison, see below |
 
-This is the classic Rust performance shape: the bounds checks are usually free because the
-compiler eliminates them, but when it can't, you help it by expressing the loop so the
-safety is structural rather than checked.
+The `-O2`→`-O3` change was not an optimization so much as a **correction**: C++ was being
+built at `-O2` while Rust used its release default of `opt-level 3`, which made Rust look
+~20% faster than it was. That is benchmarking a flag, not a language.
 
-### C — Stop recomputing something that never changes
+---
 
-Attention divides by the square root of `head_dim`. `head_dim` is 4. The code was calling the
-`pow` function to work out √4 = 2.0 once per layer per token — hundreds of thousands of times
-to always get 2.0. Now it's computed once when the model loads.
+## OxCaml
 
-**It made no measurable difference.** LLVM already recognises `pow(x, 0.5)` and rewrites it
-as a `sqrt` instruction, so the "expensive" call was already cheap. Kept anyway because it
-removes genuinely redundant work and reads more clearly — but it earns its place on clarity,
-not speed. The same change was applied to the C++ port so neither language gets an unearned
-advantage.
+| change | delta | verdict |
+|---|---|---|
+| `-O3 -unsafe` | **+60.1%**, 7/7 rounds | real |
+| **4-way unrolled `linear`** | **+61.1%**, 7/7 rounds | real |
+
+Net ~2.6x faster than the first working version, closing the gap to C++ from 3.8x to ~1.8x.
+
+**Bounds checks (`-unsafe`), +60%.** OCaml checks every `a.(i)` against the array length at
+run time, and this program is almost entirely array indexing. This is a real safety trade —
+the same level C++ has by default, but note the contrast with Rust, which reached the same
+place *without* giving anything up because the compiler proved the indexes in range instead.
+A bounds-checked binary is one variable away, with identical output:
+
+```bash
+OCAMLFLAGS="-O3" bash impl/oxcaml/build.sh   # ~60% slower
+```
+
+**Unrolling, +61%.** Diagnosed by elimination: allocation was measured at 12.9 words per
+forward pass with zero minor collections, ruling out float boxing, which left code
+generation. flambda2 was not interleaving output rows at all.
+
+---
+
+## Python
+
+One change, and it was a **correctness fix that also happened to be faster**: replacing
+`sum(genexp)` with explicit `acc += ...` loops. CPython ≥3.12 applies Neumaier compensated
+summation to floats, so the reference was computing *different arithmetic* from the compiled
+ports — 141 of 214 dot products differed. Removing the compensation made Python **faster**,
+because compensated summation does extra work per element. See PORTING.md trap 1.
+
+That correction also cut the headline speedup claim from ~142x to ~102x, since the earlier
+figure had Python doing arithmetic the other ports never did.
 
 ---
 
 ## Things that did not work
 
 **`-C target-cpu=native` / `-march=native` made both languages slower** — Rust −9.8%, C++
-−6.5%. The dot products are chains of dependent additions, and the contract forbids
-reassociating them, so wider vector registers can't be used for the reduction at all. You get
-the setup cost and, on some chips, a frequency drop, for no benefit. Measure before assuming
-newer instructions help.
+−6.5%. The dot products are chains of dependent additions and the contract forbids
+reassociating them, so wider vector registers cannot be used for the reduction at all. You
+pay the setup cost, and on some chips a frequency drop, for nothing.
 
 ---
 
 ## Still on the table
 
-Not done, roughly in order of expected value:
+- **Wider unrolling** (8-way) now that 4-way is known to pay, especially in OCaml.
+- **The same treatment for the attention accumulation loops**, which are still scalar chains.
+- **Flatten the KV cache** into one allocation indexed by `layer*block_size*n_embd + slot*n_embd`.
+- **`lm_head`'s 27 rows** leave a 3-row tail on the slow path after 4-way unrolling.
 
-- **Flatten the KV cache** into one allocation indexed by `layer*block_size*n_embd + slot*n_embd`,
-  removing the remaining pointer indirection that A only partly avoided.
-- **Manually unroll `linear` across output rows** to expose more instruction-level
-  parallelism. The dot products already run at ~1.4 cycles per multiply-add against a ~4
-  cycle dependency chain, so the compiler is interleaving rows already — but more explicit
-  unrolling might squeeze further.
-- **Skip the logits→probs copy** in the scoring path.
+Roughly 20–30% of runtime is `exp` and `pow` calls the numerics contract *requires* (`pow` in
+rmsnorm, `exp` in every softmax). That bounds any remaining win.
 
-Roughly 20–30% of runtime is `exp` and `pow` calls that the numerics contract *requires*
-(`pow` in rmsnorm, `exp` in every softmax). That is a hard floor unless the contract changes.
-
-Profiling detail, including where the cycles go per region, is in
-[PORTING.md section 7](PORTING.md).
+Profiling detail — where the cycles go per region — is in [PORTING.md section 7](PORTING.md).

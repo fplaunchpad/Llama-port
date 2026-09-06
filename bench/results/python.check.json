@@ -17,7 +17,7 @@
     "uchars": "abcdefghijklmnopqrstuvwxyz",
     "num_weights": 4192
   },
-  "load_seconds": 0.0010095001198351383,
+  "load_seconds": 0.0011068000458180904,
   "cpu_pin": "cpu0",
   "check": {
     "prompt": "emma",
