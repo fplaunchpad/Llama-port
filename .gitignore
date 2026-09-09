@@ -15,6 +15,10 @@ __pycache__/
 # Logs and scratch
 *.log
 
+# Exported chat transcripts. Local record only - never committed. These contain the
+# full session log including file contents and command output.
+chats/
+
 # Kept on purpose (do not ignore):
 #   weights/microgpt.bin   - lets a reviewer verify the golden values without training
 #   data/*.txt             - the exact evaluation splits the numbers come from
