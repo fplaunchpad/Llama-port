@@ -75,11 +75,33 @@ IMPLS = {
         missing="not built yet - run with --build (needs impl/rust/src/main.rs)",
         src=p("impl", "rust", "src", "main.rs"),
     ),
-    # OxCaml targets linux-x86_64, so on Windows it runs through WSL. Correctness is
-    # platform-independent (verified: identical output under Windows UCRT and Linux
-    # glibc), so the agreement gate covers it here - but a WSL binary timed against
-    # Windows-native ones would measure the OS, so it is excluded from the speed table.
-    # Use tools/bench_wsl.sh for its timings.
+    # The two OCaml entries are the SAME source built by different compilers: "ocaml"
+    # by the stock upstream ocamlopt (closure middle-end), "oxcaml" by Jane Street's
+    # flambda2 variant. impl/ocaml/build.sh asserts the sources have not drifted, so
+    # the gap between these two rows is the middle-end and nothing else.
+    #
+    # Both are routed through WSL on Windows. The OxCaml compiler targets linux-x86_64
+    # and the stock one is kept alongside it for the comparison to be apples to apples.
+    # Correctness is platform-independent (verified: identical output under Windows UCRT
+    # and Linux glibc), so the agreement gate covers them here - but a WSL binary timed
+    # against Windows-native ones would measure the OS, so they are excluded from the
+    # speed table. Use tools/bench_wsl.sh for their timings.
+    "ocaml": dict(
+        label="OCaml",
+        run=(["wsl.exe", "-d", "Debian", "--",
+              to_wsl(p("impl", "ocaml", "build", "microgpt_infer"))]
+             if os.name == "nt" else [p("impl", "ocaml", "build", "microgpt_infer")]),
+        path_map=to_wsl if os.name == "nt" else None,
+        correctness_only=os.name == "nt",
+        build=["wsl.exe", "-d", "Debian", "--", "bash",
+               to_wsl(p("impl", "ocaml", "build.sh"))] if os.name == "nt"
+              else ["bash", p("impl", "ocaml", "build.sh")],
+        build_needs=lambda: os.name != "nt" or shutil.which("wsl.exe") is not None,
+        build_missing="wsl.exe not on PATH - the OCaml ports are built on Linux here",
+        probe=lambda: os.path.exists(p("impl", "ocaml", "build", "microgpt_infer")),
+        missing="not built yet - run with --build (needs a stock ocamlopt)",
+        src=p("impl", "ocaml", "main.ml"),
+    ),
     "oxcaml": dict(
         label="OxCaml",
         run=(["wsl.exe", "-d", "Debian", "--",

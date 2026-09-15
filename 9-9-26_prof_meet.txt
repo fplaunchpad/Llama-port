@@ -1,0 +1,31 @@
+(
+polling disable for single threaded - ocaml
+
+polling.ml in asmcomp
+)
+
+
+(
+    add a library in ocaml with unsafe impl of internal pointers, register as root for alive, internal pointers are abstracted (ptr+-1)
+)
+
+unsafe memory in ocaml runtime (get OCAML test suite running for "correctness")
+
+try to take adv of x86 instr richness
+
+(replace polling with nops to try seeing speedup
+binary edits) [DONE]
+
+use plain ocaml [DONE]
+
+loop unrolling [DONE]
+
+send without unsafe [DONE]
+
+(oxcaml simd - page and explicit simd 
+- Avik
+
+ --> the difference without vectorisation is still huge, cpp only loses very less(~6%)
+) 
+
+skill for porting microgpt

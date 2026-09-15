@@ -17,7 +17,7 @@
     "uchars": "abcdefghijklmnopqrstuvwxyz",
     "num_weights": 4192
   },
-  "load_seconds": 0.0027980804443359375,
+  "load_seconds": 0.019831180572509766,
   "cpu_pin": "external (taskset)",
   "check": {
     "prompt": "emma",

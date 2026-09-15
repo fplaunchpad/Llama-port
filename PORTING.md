@@ -4,8 +4,8 @@
 and JSON shape. Read sections 2–7 of it first. This file is the other half: **what actually
 goes wrong**, in the order it is likely to bite you.
 
-Every trap listed here was found the hard way while writing the C++ and Rust ports. Seven of
-them were real defects that shipped and had to be fixed. Two survived a full benchmark run
+Every trap listed here was found the hard way while writing the C++, Rust and OCaml ports.
+Seven of them were real defects that shipped and had to be fixed. Two survived a full benchmark run
 looking perfectly correct, because the outputs happened to agree anyway.
 
 The headline lesson: **agreeing outputs are not proof of a correct port.** Floating-point
@@ -357,7 +357,20 @@ in `bench/run.py`:
 ),
 ```
 
-Then add it to `IMPLS` in `tools/test_shapes.py` too, so the shape sweep covers it.
+Then add it to `IMPLS` in `tools/test_shapes.py` too, so the shape sweep covers it, and to
+the build+run lists in `tools/bench_wsl.sh` (the uniform timing run) and
+`tools/bench_variants.sh` (the optimization matrix).
+
+**If your port needs a compiler that only runs elsewhere**, follow what the two OCaml entries
+do: route `run` and `build` through `wsl.exe`, set `path_map` so the paths handed to the
+binary are translated, and set `correctness_only` so the harness checks its agreement but
+keeps it out of the native speed table. Timing a WSL binary against Windows-native ones
+measures the OS.
+
+**If you are adding the same language twice** — a second compiler, a second backend — keep
+the two sources byte-identical and assert it in the build, as `impl/ocaml/build.sh` does
+against `impl/oxcaml/main.ml`. Without that assertion the rows drift apart over time and
+quietly stop being a compiler comparison, with nothing in the output to say so.
 
 Two structural requirements that are easy to miss:
 
@@ -400,13 +413,13 @@ Do not read a green suite as proof of a perfect port.
 
 - ~~One platform per language.~~ **Now tested.** The same C++ source built with g++ 15.2 on
   Windows (UCRT libm) and g++ 14.2 on Linux (glibc libm) produces **bit-identical** output:
-  same perplexity to the last digit, same generated text, same checksums. The OxCaml port,
-  which only runs on Linux, agrees with all three. So cross-platform agreement holds in
+  same perplexity to the last digit, same generated text, same checksums. Both OCaml ports,
+  which only run on Linux here, agree with all three. So cross-platform agreement holds in
   practice on x86-64, at least for these two libm implementations. Cross-platform *timing*
   remains meaningless — build and time everything in one environment.
 - **The `block_size` truncation branch is never exercised.** The longest name is 15
   characters, so `n = min(block_size, len(tokens)-1)` never actually truncates. A bug in that
-  branch is invisible in all four implementations.
+  branch is invisible in all five implementations.
 - **No fuzzing.** Agreement is verified on 4 fixed shapes and one corpus, not over random
   weights, random documents or random settings.
 - **NaN / Inf paths are unexercised.** Trap 4 was fixed by inspection, not by a test.
@@ -424,7 +437,9 @@ comparison and a corpus containing a document long enough to trigger truncation.
 Correctness first — but once your port agrees, here is where the time actually goes and what
 is safe to optimize. Measured by instrumenting the Rust port with `rdtsc` region counters.
 
-**Where the cycles go** (generation, `n_layer=1`, `n_embd=16`, average context 3.5):
+**Where the cycles go** (generation, `n_layer=1`, `n_embd=16`, average context 3.5). Measured
+with `tools/profile_regions.py`, which will reproduce this split for C++ and both OCaml builds
+and show region by region where each one loses:
 
 | region | share | work (MACs) | cyc/op | verdict |
 |---|---:|---:|---:|---|
@@ -442,10 +457,12 @@ Two structural facts fall out of this:
   multiply-accumulate. A 16-element dot product is a chain of 16 *dependent* f64 adds at ~4
   cycles of latency each, so a single chain would cost 4 cyc/MAC; landing at 1.4 means the
   compiler is *partly* interleaving independent output rows. It turns out not to be doing
-  that fully: unrolling four output rows **by hand** is worth **+21.6% in C++, +5.1% in Rust
-  and +61% in OCaml**. An earlier version of this document claimed the compilers had already
-  extracted this and no more was available — that was wrong, and measuring it is what proved
-  it. See OPTIMIZATIONS.md.
+  that fully: unrolling four output rows **by hand** is worth **+19% in C++, +5% in Rust,
+  +54% under OxCaml and +221% under the stock OCaml compiler**. An earlier version of this
+  document claimed the compilers had already extracted this and no more was available — that
+  was wrong, and measuring it is what proved it. The ~46x spread across those four backends is
+  also the answer to "how much does my compiler matter": entirely, right up until you write
+  the loop out by hand yourself. See OPTIMIZATIONS.md.
 - **~20–30% of runtime is libm** — roughly 3 `pow` and 41 `exp` calls per token, all of them
   mandated by the contract (`pow` in rmsnorm, `exp` in every softmax). That is a hard floor
   unless the contract changes.
@@ -461,6 +478,36 @@ Two structural facts fall out of this:
 The first two are specific to bounds-checked languages — the C++ port already used raw
 pointers in both places. The third was slack in *both* ports.
 
+**If your language has no interior pointers, `linear` will cost you.** C++ and Rust walk the
+weight matrix with four raw pointers into the middle of the allocation plus one shared
+offset, advancing all four output rows with a single `add`. A precise tracing GC usually
+cannot allow that — it must find the header of the block any pointer refers to, and the
+header sits immediately before the data, so a pointer into the middle of an array is not a
+valid value. OCaml therefore re-derives `base + index` for every row on every iteration: 8
+integer instructions where C++ spends 1, which is the single largest line in the budget
+below. Measured per 4 multiply-accumulates, the OCaml inner loop is 23 instructions against
+C++'s 15, and both spend exactly 8 of them on arithmetic. If you hit this, the fix is to
+stop the loop needing a live index at all — see OPTIMIZATIONS.md for the `cols`-specialized
+full unroll, where constant offsets fold into the addressing mode and the arithmetic
+disappears entirely.
+
+**Do not assume the gap is SIMD.** It is the obvious explanation and it was wrong here:
+rebuilding the C++ port with `-fno-tree-vectorize` — removing every packed instruction —
+costs it only **6.2%**, and un-vectorized C++ is still 1.60x faster than OxCaml. Vector
+width was worth far less than the scalar bookkeeping around it. Measure before you optimize
+for it.
+
+**If you are porting to a language with a tracing GC, price its safepoints.** OCaml 5 emits
+a poll on every loop back edge it cannot prove short — the `linear` inner loop allocates
+nothing, so it would otherwise contain no safepoint at all. Building without them
+(`ocamlopt -disable-poll-insertion`) is worth **+15.2%** on the shipped OxCaml binary. The
+trap is *why*: overwriting the same poll instructions with NOPs in the linked binary gains
+**+0.1%**, so the cost is not the two instructions. A value cannot live in `%r11` across a
+poll, and in the register-starved unrolled kernel losing that register forces a stack spill
+reloaded every iteration. Measure the constraint, not the instruction count — and note the
+poll-free binary is a diagnostic, not something to ship, since nothing can preempt it.
+`tools/bench_polls.sh` and OPTIMIZATIONS.md have the full treatment.
+
 **What does not work.** `-C target-cpu=native` / `-march=native` made things **slower**:
 −9.8% for Rust, −6.5% for C++, on this machine. The reduction cannot be vectorized without
 reassociation, so wider registers buy nothing while still costing setup and, on some parts,
@@ -473,7 +520,7 @@ logits→probs copy in the scoring path.
 
 ### Is any of this parallelizable?
 
-All three reference implementations are strictly single-threaded, and mostly must be:
+Every reference implementation is strictly single-threaded, and mostly must be:
 
 - **Within a token** the forward pass is a dependency chain (rmsnorm → qkv → attention → wo →
   mlp → lm_head). The independent work — 16 to 64 output rows in a `linear` — is at

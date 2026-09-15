@@ -42,15 +42,18 @@ def _to_wsl(path):
     drive, rest = os.path.splitdrive(os.path.abspath(path))
     return "/mnt/" + drive[0].lower() + rest.replace("\\", "/")
 
-# OxCaml is linux-only; on Windows it runs through WSL. It matters most here, because
-# this sweep is what exercises the multi-layer weight-loading path.
-_OX = os.path.join(ROOT, "impl", "oxcaml", "build", "microgpt_infer")
-if os.path.exists(_OX):
-    IMPLS["oxcaml"] = (["wsl.exe", "-d", "Debian", "--", _to_wsl(_OX)]
-                       if os.name == "nt" else [_OX])
-    _WSL_IMPLS = {"oxcaml"} if os.name == "nt" else set()
-else:
-    _WSL_IMPLS = set()
+# Both OCaml builds are linux-only here; on Windows they run through WSL. This sweep
+# matters most for them, because it is what exercises the multi-layer weight-loading
+# path - the explicit per-layer `take` loop that Array.init would have left to
+# unspecified evaluation order.
+_WSL_IMPLS = set()
+for _name in ("ocaml", "oxcaml"):
+    _bin = os.path.join(ROOT, "impl", _name, "build", "microgpt_infer")
+    if os.path.exists(_bin):
+        IMPLS[_name] = (["wsl.exe", "-d", "Debian", "--", _to_wsl(_bin)]
+                        if os.name == "nt" else [_bin])
+        if os.name == "nt":
+            _WSL_IMPLS.add(_name)
 
 
 def run(cmd, **kw):

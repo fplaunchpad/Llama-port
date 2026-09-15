@@ -2,6 +2,7 @@
 impl/rust/target/
 impl/cpp/build/
 impl/oxcaml/build/
+impl/ocaml/build/
 *.exe
 *.pdb
 *.o

@@ -1,15 +1,22 @@
 # microgpt port benchmark — contract
 
-Four implementations of the same inference algorithm — Python, C++, Rust, OxCaml — measured
-on **token generation speed** and **held-out perplexity**, loading **identical weights**.
+Five implementations of the same inference algorithm — Python, C++, Rust, OxCaml and plain
+OCaml — measured on **token generation speed** and **held-out perplexity**, loading
+**identical weights**.
 
 Any port that follows this document can be dropped into `bench/run.py` and compared.
 
+The last two are the same OCaml source under two different compilers: `oxcaml` is built by
+Jane Street's OxCaml variant (flambda2 middle-end, `-O3`), `ocaml` by the stock upstream
+compiler (closure middle-end, where `-O3` does not exist). `impl/ocaml/build.sh` asserts the
+two sources have not drifted, so the gap between those two rows is the compiler and nothing
+else. See [OPTIMIZATIONS.md](OPTIMIZATIONS.md) for what that gap turns out to be.
+
 ## Current results
 
-**The headline comparison is the uniform one:** all four implementations built with matched
+**The headline comparison is the uniform one:** all five implementations built with matched
 optimization levels and timed inside a single Linux environment (WSL Debian), pinned with
-`taskset`, 11 interleaved rounds. Reproduce with:
+`taskset`, 9 interleaved rounds. Reproduce with:
 
 ```bash
 wsl -d Debian -- bash tools/bench_wsl.sh          # from the repo root
@@ -19,51 +26,66 @@ wsl -d Debian -- bash tools/bench_wsl.sh          # from the repo root
 
 | impl | runtime | tok/s (median) | vs Python | vs fastest |
 |---|---|---:|---:|---:|
-| cpp | g++ 14.2 `-O3` | 745,823 | **121x** | 100% |
-| rust | rustc 1.98.1 `--release` | 654,331 | **106x** | 88% |
-| oxcaml | ocamlopt 5.2.0+ox `-O3 -unsafe` | 320,632 | **52x** | 43% |
-| python | CPython 3.13.5 | 6,179 | 1.0x | 1% |
+| cpp | g++ 14.2 `-O3` | 732,253 | **115x** | 100% |
+| rust | rustc 1.98.1 `--release` | 671,684 | **106x** | 92% |
+| oxcaml | ocamlopt 5.2.0+ox `-O3 -unsafe` (flambda2) | 407,168 | **64x** | 56% |
+| ocaml | ocamlopt 5.3.0 `-unsafe` (closure) | 402,971 | **64x** | 55% |
+| python | CPython 3.13.5 | 6,348 | 1.0x | 1% |
 
 ### Perplexity throughput
 
 | impl | tok/s (median) | vs Python |
 |---|---:|---:|
-| cpp | 757,756 | 115x |
-| rust | 676,181 | 103x |
-| oxcaml | 337,985 | 52x |
-| python | 6,566 | 1.0x |
+| cpp | 732,113 | 112x |
+| rust | 671,177 | 103x |
+| oxcaml | 407,068 | 63x |
+| ocaml | 391,495 | 60x |
+| python | 6,516 | 1.0x |
 
-Perplexity itself is **10.789614873329409** for all four, bit-identical, as is the generated
+Perplexity itself is **10.789614873329409** for all five, bit-identical, as is the generated
 text (`0xae6c6ffbd8f5b02c`) and `weights_sum`.
 
-Paired over 11 rounds: Rust −10.2% vs C++ on gen and −10.5% on ppl, losing 0/11 both times.
-OxCaml −56.3% / −55.4%. Within each implementation gen and ppl agree closely, which is the
-cross-check that the timing is sound — both run the same forward pass, so they must.
+Paired over 9 rounds: Rust −8.6% vs C++ on gen and −8.3% on ppl. OxCaml −44.7% / −44.2%,
+plain OCaml −44.7% / −46.2%. Within each implementation gen and ppl agree closely, which is
+the cross-check that the timing is sound — both run the same forward pass, so they must.
 
 The same picture on Windows for the three that run there natively (12 paired rounds,
 `python tools/track_opt.py`): C++ 883,446 tok/s, Rust 849,316, C++ ahead by 4.6% winning
 12/12. Absolute numbers differ between the two environments; the *ordering* agrees.
 
+**The two OCaml rows land on top of each other**, and that is the result, not a rounding
+artifact: paired per round, flambda2's lead on the shipped kernel is a few percent and it
+wins only 6 of 9 rounds — this run cannot separate it from noise. The same two compilers are
+2.1x apart on the *unoptimized* kernel — flambda2
+finds instruction-level parallelism in the plain dot-product loop that the closure backend
+does not — and hand-unrolling the kernel four ways hands that same parallelism to both,
+which is what collapses the gap. One caveat on the controlled variable: the two compilers
+are a language minor version apart (5.2.0+ox against 5.3.0), because that is what the OxCaml
+switch pins. The middle-end dominates, but it is not the only thing that differs.
+
 **Ranking note.** Rust led C++ until the 4-way `linear` unroll was applied to both: that
-change is worth ~+21% to C++ and only ~+6% to Rust, so C++ moved ahead. Every optimization
+change is worth ~+19% to C++ and only ~+5% to Rust, so C++ moved ahead. Every optimization
 is a build switch, so the whole ladder can be re-measured:
 
 ```bash
 wsl -d Debian -- bash tools/bench_variants.sh     # from the repo root
 ```
 
-That produces a `<language>_<optimization>` matrix — 9 variants, all bit-identical, ranging
-from 6,805 tok/s (`python`) to 877,892 (`cpp_unroll`). It shows plainly that **optimization
+That produces a `<language>_<optimization>` matrix — 19 variants, all bit-identical, ranging
+from 6,672 tok/s (`python`) to 827,692 (`cpp_unroll`). It shows plainly that **optimization
 effort, not language choice, decided the ranking**: unoptimized Rust beats C++ at `-O2` and
-ties it at `-O3`, while fully optimized C++ leads by 16%. See
-[OPTIMIZATIONS.md](OPTIMIZATIONS.md).
+at `-O3`, while fully optimized C++ leads by 11.3%. Both OCaml compilers get the full
+{`-unsafe`, bounds-checked} × {plain, unrolled} grid there, because those two switches
+interact, plus an `MG_SR=1` build that hand-applies the strength reduction flambda2 will not
+do; OxCaml also gets `_pollfree` builds that price its GC safepoint poll.
+See [OPTIMIZATIONS.md](OPTIMIZATIONS.md).
 
 ### Correctness is portable; speed is not
 
 Verified here: the same C++ source under g++ 15.2 / Windows UCRT and g++ 14.2 / Linux glibc
 produces **bit-identical** output. So agreement can be chained across platforms — which is
-how the OxCaml port, which only builds for linux-x86_64, is confirmed identical to the other
-three. Timing cannot be chained that way: comparing a Windows-native binary against a WSL one
+how the OxCaml port, which only builds for linux-x86_64, is confirmed identical to the
+others. Timing cannot be chained that way: comparing a Windows-native binary against a WSL one
 measures the OS and libm, not the language, which is why `tools/bench_wsl.sh` builds and
 times everything in one place.
 
@@ -103,7 +125,7 @@ python tools/train_export.py --steps 1000
 `tools/train_export.py` is a faithful copy of microgpt.py's math, RNG call order and
 optimizer, so it produces exactly the weights microgpt.py would hold when its own training
 loop ends. It then writes `weights/microgpt.bin`. **After that nothing ever trains again** —
-all four implementations are inference-only and just read that file.
+all five implementations are inference-only and just read that file.
 
 Current checkpoint: 1,000 steps, train loss 3.37 → 2.32, held-out perplexity 10.79
 (uniform baseline is 27.0).
@@ -152,7 +174,7 @@ layout bug, and everything downstream is meaningless.
 
 ## 3. Numerics contract
 
-All four implementations compute in **f64** and must apply operations in the same order, so
+All five implementations compute in **f64** and must apply operations in the same order, so
 that perplexity agrees to ~1e-12 rather than merely "close enough". Reproduce these exactly:
 
 ```
@@ -370,7 +392,7 @@ Every implementation accepts the same flags, so `bench/run.py` can drive them un
 
 `--pin` is accepted by every implementation, but a port whose language has no affinity
 binding may report `"cpu_pin": "external (taskset)"` and rely on being pinned from outside
-instead. The OxCaml port does this, since OCaml's stdlib exposes no `sched_setaffinity`;
+instead. Both OCaml ports do this, since OCaml's stdlib exposes no `sched_setaffinity`;
 `tools/bench_wsl.sh` and `tools/bench_variants.sh` pass `--pin -1` and use `taskset` for
 every implementation, so all of them get identical treatment.
 | `--max-docs N` | `0` (all) | truncate the perplexity set |
@@ -437,7 +459,7 @@ for each byte b: h ^= b; h = h * 0x100000001B3   // wrapping
 never from the time-budgeted ones, so they stay comparable across implementations.
 
 `check.first3_nll` must group its summation per document and then add, the same way the
-perplexity path does - all four implementations route it through their `score_doc` helper
+perplexity path does - all five implementations route it through their `score_doc` helper
 for exactly this reason. Folding every token into one running total is a different summation
 order and shifts the last digits, which reads as a cross-language mismatch when it is only
 the fingerprint disagreeing with itself.
@@ -464,16 +486,23 @@ implementation. Do not compare a hash against one recorded from a different sett
 ```bash
 python tools/train_export.py --steps 1000     # once, ~80s, produces the weights
 python tools/validate.py                      # plain-float forward vs microgpt.py autograd
-python bench/run.py --build                   # build C++/Rust, run all, print the table
+python bench/run.py --build                   # build every port, run all, print the table
 ```
 
 Useful variations:
 
 ```bash
 python bench/run.py --impls python,cpp --repeats 9 --time-budget 1.0
+python bench/run.py --impls ocaml,oxcaml      # the two compilers, same source
 python bench/run.py --check-only              # correctness agreement, no timing
 python bench/run.py --pin -1                  # disable CPU pinning
 ```
+
+Both OCaml ports are built by their own `build.sh`, which `--build` invokes (through
+`wsl.exe` on Windows, since the OxCaml compiler targets linux-x86-64 and the stock one is
+kept beside it so the two are comparable). They are checked for agreement on Windows but
+left out of the speed table there, because timing a WSL binary against Windows-native ones
+measures the OS. `tools/bench_wsl.sh` is where their numbers come from.
 
 Benchmark hygiene: close other heavy processes, keep the machine on AC power, and prefer the
 `_best` numbers. If `spread` stays above ~1.25x, the ratios are indicative rather than

@@ -8,7 +8,11 @@
 # Windows. Correctness is platform-independent - the same C++ source under g++ 15.2 /
 # Windows UCRT and g++ 14.2 / Linux glibc produces bit-identical output - but SPEED is
 # not. Comparing a Windows-native binary against a WSL one measures the OS and libm, not
-# the language. So all four are built here, with the same flags, and timed together.
+# the language. So all five are built here, with matched flags, and timed together.
+#
+# Two of the five are the same OCaml source under different compilers - `oxcaml`
+# (flambda2) and `ocaml` (stock upstream, closure middle-end). Having both in one
+# interleaved run is the only way the middle-end gap is measured rather than guessed.
 #
 # Pinning uses taskset rather than each program pinning itself, so every implementation
 # gets identical treatment regardless of what its language can express.
@@ -35,9 +39,17 @@ g++ -O3 -std=c++20 -fno-fast-math -ffp-contract=off -o "$OUT/cpp" impl/cpp/infer
   && echo "  cpp     $(g++ --version | head -1)" || echo "  cpp     BUILD FAILED"
 
 if bash impl/oxcaml/build.sh >/dev/null 2>&1; then
-  echo "  oxcaml  ocamlopt $(eval "$(opam env --switch=5.2.0+ox 2>/dev/null)"; ocamlopt -version) -O3 -unsafe"
+  echo "  oxcaml  ocamlopt $(eval "$(opam env --switch=5.2.0+ox 2>/dev/null)"; ocamlopt -version) -O3 -unsafe  (flambda2)"
 else
   echo "  oxcaml  BUILD FAILED"
+fi
+
+# Same source as oxcaml, stock upstream compiler. build.sh refuses to run against a
+# flambda2 ocamlopt, so this row cannot silently become a second OxCaml build.
+if bash impl/ocaml/build.sh >/dev/null 2>&1; then
+  echo "  ocaml   ocamlopt $(ocamlopt -version 2>/dev/null) -unsafe  (closure)"
+else
+  echo "  ocaml   BUILD FAILED (no stock ocamlopt? set MG_OCAML_SWITCH)"
 fi
 
 # Build Rust into a Linux-only target dir: impl/rust/target holds the Windows build,
@@ -61,6 +73,7 @@ IMPLS=()
 [ -x "$OUT/cpp" ] && IMPLS+=("cpp|$OUT/cpp")
 [ -n "$RUST_BIN" ] && [ -x "$RUST_BIN" ] && IMPLS+=("rust|$RUST_BIN")
 [ -x impl/oxcaml/build/microgpt_infer ] && IMPLS+=("oxcaml|$ROOT/impl/oxcaml/build/microgpt_infer")
+[ -x impl/ocaml/build/microgpt_infer ] && IMPLS+=("ocaml|$ROOT/impl/ocaml/build/microgpt_infer")
 IMPLS+=("python|python3 $ROOT/impl/python/infer.py")
 
 COMMON=(--weights "$ROOT/weights/microgpt.bin" --data "$ROOT/data/val.txt"

@@ -4,9 +4,18 @@
 #
 #   wsl -d Debian -- bash tools/bench_variants.sh     (run from the repo root)
 #
-# tools/bench_wsl.sh compares the four shipped ports against each other. This one opens
+# tools/bench_wsl.sh compares the five shipped ports against each other. This one opens
 # each port up and compares its optimization levels, so the numbers in OPTIMIZATIONS.md
 # can be re-measured rather than taken on trust.
+#
+# Both OCaml compilers get the full {safe, unsafe} x {plain, unrolled} grid rather than
+# a single ladder. Two reasons: -unsafe and the unroll interact (the unrolled kernel has
+# four times as many bounds checks to elide), and holding the source fixed across the
+# two compilers turns the oxcaml-vs-ocaml rows into a clean flambda2-vs-closure figure.
+#
+# OxCaml additionally gets two *_pollfree builds, which drop the GC safepoint poll. Those
+# are diagnostic, not shippable - see the comment on them below, and tools/bench_polls.sh
+# for the full treatment of what a poll actually costs and why.
 #
 # Every variant must produce byte-identical output. A variant that does not is a bug,
 # and the script says so instead of quietly ranking it.
@@ -54,12 +63,62 @@ else
 fi
 
 # ---- OxCaml : bounds checks, and the 4-way unroll ---------------------------
+# The full 2x2: {safe, unsafe} x {plain, unrolled}. safe_unroll is not a step on the
+# way to anything shipped - it is there so the cost of -unsafe can be read off at BOTH
+# unroll levels. Bounds checks and the unroll are not independent: the unrolled kernel
+# does four indexed loads per iteration instead of one, so it has four times as many
+# checks to pay for, and the two effects have to be measured together to be believed.
 MG_UNROLL=0 OCAMLFLAGS="-O3"         OUT="$OUT/oxcaml_safe_plain"     bash impl/oxcaml/build.sh >/dev/null 2>&1 \
   && echo "  oxcaml_safe_plain" || echo "  oxcaml_safe_plain FAILED"
+MG_UNROLL=1 OCAMLFLAGS="-O3"         OUT="$OUT/oxcaml_safe_unroll"    bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_safe_unroll" || echo "  oxcaml_safe_unroll FAILED"
 MG_UNROLL=0 OCAMLFLAGS="-O3 -unsafe" OUT="$OUT/oxcaml_unsafe_plain"   bash impl/oxcaml/build.sh >/dev/null 2>&1 \
   && echo "  oxcaml_unsafe_plain" || echo "  oxcaml_unsafe_plain FAILED"
 MG_UNROLL=1 OCAMLFLAGS="-O3 -unsafe" OUT="$OUT/oxcaml_unsafe_unroll"  bash impl/oxcaml/build.sh >/dev/null 2>&1 \
   && echo "  oxcaml_unsafe_unroll (shipped)" || echo "  oxcaml_unsafe_unroll FAILED"
+
+# ---- OxCaml : without GC safepoint polls -------------------------------------
+# -disable-poll-insertion drops the back-edge poll that makes a long non-allocating
+# loop preemptible. NOT shippable - without it, signals are delayed indefinitely and a
+# multicore stop-the-world minor GC would hang - but it prices what the poll costs.
+# The answer is not the two instructions it executes (tools/bench_polls.sh NOPs those
+# out of the linked binary and gains nothing); it is that a value cannot live in %r11
+# across a poll, which in the register-starved unrolled kernel forces a spill.
+# Both kernels are built because only the unrolled one is short of registers.
+# Stock ocamlopt has no equivalent flag, so there is no ocaml_* counterpart.
+MG_UNROLL=0 OCAMLFLAGS="-O3 -unsafe -disable-poll-insertion" \
+  OUT="$OUT/oxcaml_unsafe_plain_pollfree"  bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_plain_pollfree" || echo "  oxcaml_unsafe_plain_pollfree FAILED"
+MG_UNROLL=1 OCAMLFLAGS="-O3 -unsafe -disable-poll-insertion" \
+  OUT="$OUT/oxcaml_unsafe_unroll_pollfree" bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_unroll_pollfree" || echo "  oxcaml_unsafe_unroll_pollfree FAILED"
+
+# ---- OCaml (stock upstream compiler) : the same 2x2 -------------------------
+# Same source, closure middle-end instead of flambda2, and no -O3 to pass because the
+# flag is flambda-only. Lining the two ladders up side by side shows which of the
+# OxCaml numbers come from the language and which come from the compiler.
+MG_UNROLL=0 OCAMLFLAGS=""        OUT="$OUT/ocaml_safe_plain"      bash impl/ocaml/build.sh >/dev/null 2>&1 \
+  && echo "  ocaml_safe_plain" || echo "  ocaml_safe_plain FAILED"
+MG_UNROLL=1 OCAMLFLAGS=""        OUT="$OUT/ocaml_safe_unroll"     bash impl/ocaml/build.sh >/dev/null 2>&1 \
+  && echo "  ocaml_safe_unroll" || echo "  ocaml_safe_unroll FAILED"
+MG_UNROLL=0 OCAMLFLAGS="-unsafe" OUT="$OUT/ocaml_unsafe_plain"    bash impl/ocaml/build.sh >/dev/null 2>&1 \
+  && echo "  ocaml_unsafe_plain" || echo "  ocaml_unsafe_plain FAILED"
+MG_UNROLL=1 OCAMLFLAGS="-unsafe" OUT="$OUT/ocaml_unsafe_unroll"   bash impl/ocaml/build.sh >/dev/null 2>&1 \
+  && echo "  ocaml_unsafe_unroll  (shipped)" || echo "  ocaml_unsafe_unroll FAILED"
+
+# ---- Both OCaml compilers : the hand strength reduction ---------------------
+# Carries the four row offsets as running indices instead of rebuilding base + i per row
+# per iteration, because flambda2 does not do that strength reduction itself. Identical
+# arithmetic in identical order, so the output hash is unchanged. Built for BOTH compilers
+# because it helps one and hurts the other, and that contrast is the result.
+MG_SR=1 OCAMLFLAGS="-O3 -unsafe" OUT="$OUT/oxcaml_unsafe_sr" bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_sr" || echo "  oxcaml_unsafe_sr FAILED"
+MG_SR=1 OCAMLFLAGS="-unsafe"    OUT="$OUT/ocaml_unsafe_sr"  bash impl/ocaml/build.sh  >/dev/null 2>&1 \
+  && echo "  ocaml_unsafe_sr" || echo "  ocaml_unsafe_sr FAILED"
+# and strength reduction stacked with poll removal, which are independent causes
+MG_SR=1 OCAMLFLAGS="-O3 -unsafe -disable-poll-insertion" \
+  OUT="$OUT/oxcaml_unsafe_sr_pollfree" bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_sr_pollfree" || echo "  oxcaml_unsafe_sr_pollfree FAILED"
 
 echo "  python       (one variant; its only change was a correctness fix)"
 echo
@@ -67,7 +126,11 @@ echo
 # name|command   (order sets the report order)
 VARIANTS=()
 for v in cpp_O2_plain cpp_plain cpp_unroll rust_plain rust_unroll \
-         oxcaml_safe_plain oxcaml_unsafe_plain oxcaml_unsafe_unroll; do
+         oxcaml_safe_plain oxcaml_safe_unroll oxcaml_unsafe_plain oxcaml_unsafe_unroll \
+         oxcaml_unsafe_plain_pollfree oxcaml_unsafe_unroll_pollfree \
+         oxcaml_unsafe_sr oxcaml_unsafe_sr_pollfree \
+         ocaml_safe_plain ocaml_safe_unroll ocaml_unsafe_plain ocaml_unsafe_unroll \
+         ocaml_unsafe_sr; do
   [ -x "$OUT/$v" ] && VARIANTS+=("$v|$OUT/$v")
 done
 VARIANTS+=("python|python3 $ROOT/impl/python/infer.py")
@@ -137,11 +200,23 @@ for k, v in res.items():
     print(f"| {k} | {med[k]:,.0f} | {max(v):,.0f} | {sd:,.0f} | "
           f"{med[k]/slowest:.1f}x | {med[k]/fastest*100:.0f}% |")
 
+W = max([len(k) for k in res] + [len("total")])
+
+def paired(prev, cur):
+    """median paired % change and how many rounds it won, or None if either is absent."""
+    if prev not in res or cur not in res:
+        return None
+    pd = [(a - b) / b * 100 for a, b in zip(res[cur], res[prev])]
+    return statistics.median(pd), sum(1 for x in pd if x > 0), len(pd)
+
 # per-language optimization ladders, each step against the one before it
 LADDERS = [
-    ("C++",    ["cpp_O2_plain", "cpp_plain", "cpp_unroll"]),
-    ("Rust",   ["rust_plain", "rust_unroll"]),
-    ("OxCaml", ["oxcaml_safe_plain", "oxcaml_unsafe_plain", "oxcaml_unsafe_unroll"]),
+    ("C++",                    ["cpp_O2_plain", "cpp_plain", "cpp_unroll"]),
+    ("Rust",                   ["rust_plain", "rust_unroll"]),
+    ("OxCaml (flambda2)",      ["oxcaml_safe_plain", "oxcaml_unsafe_plain",
+                                "oxcaml_unsafe_unroll"]),
+    ("OCaml (stock, closure)", ["ocaml_safe_plain", "ocaml_unsafe_plain",
+                                "ocaml_unsafe_unroll"]),
 ]
 print("\neach optimization against the step before it (paired, same rounds):")
 for lang, chain in LADDERS:
@@ -150,12 +225,57 @@ for lang, chain in LADDERS:
         continue
     print(f"\n  {lang}")
     for prev, cur in zip(chain, chain[1:]):
-        pd = [(a - b) / b * 100 for a, b in zip(res[cur], res[prev])]
-        w = sum(1 for x in pd if x > 0)
-        print(f"    {prev:22s} -> {cur:22s} {statistics.median(pd):+7.1f}%   "
-              f"faster in {w}/{len(pd)} rounds")
+        m, w, n = paired(prev, cur)
+        print(f"    {prev:{W}s} -> {cur:{W}s} {m:+7.1f}%   faster in {w}/{n} rounds")
     tot = (med[chain[-1]] / med[chain[0]] - 1) * 100
-    print(f"    {'total':22s}    {chain[0]} -> {chain[-1]}: {tot:+.1f}%")
+    print(f"    {'total':{W}s}    {chain[0]} -> {chain[-1]}: {tot:+.1f}%")
+
+# A ladder can only show one path through a 2x2, so the two OCaml grids get read off
+# directly as well. The bounds-check rows are the ones that need both unroll levels:
+# the unrolled kernel issues four indexed loads per iteration where the plain one
+# issues one, so it has four times the checks to pay for and the cost of -unsafe is
+# not the same number in the two columns.
+EFFECTS = [
+    ("cost of keeping bounds checks (no -unsafe)", [
+        ("OxCaml, plain kernel",    "oxcaml_unsafe_plain",   "oxcaml_safe_plain"),
+        ("OxCaml, unrolled kernel", "oxcaml_unsafe_unroll",  "oxcaml_safe_unroll"),
+        ("OCaml,  plain kernel",    "ocaml_unsafe_plain",    "ocaml_safe_plain"),
+        ("OCaml,  unrolled kernel", "ocaml_unsafe_unroll",   "ocaml_safe_unroll"),
+    ]),
+    ("value of the 4-way unroll, at each safety level", [
+        ("OxCaml, -unsafe",         "oxcaml_unsafe_plain",   "oxcaml_unsafe_unroll"),
+        ("OxCaml, bounds-checked",  "oxcaml_safe_plain",     "oxcaml_safe_unroll"),
+        ("OCaml,  -unsafe",         "ocaml_unsafe_plain",    "ocaml_unsafe_unroll"),
+        ("OCaml,  bounds-checked",  "ocaml_safe_plain",      "ocaml_safe_unroll"),
+    ]),
+    ("cost of the GC safepoint poll (OxCaml only - stock ocamlopt has no such flag)", [
+        ("OxCaml, plain kernel",    "oxcaml_unsafe_plain",   "oxcaml_unsafe_plain_pollfree"),
+        ("OxCaml, unrolled kernel", "oxcaml_unsafe_unroll",  "oxcaml_unsafe_unroll_pollfree"),
+    ]),
+    ("hand strength reduction of base + i (flambda2 will not do it)", [
+        ("OxCaml",                  "oxcaml_unsafe_unroll",  "oxcaml_unsafe_sr"),
+        ("OCaml (stock)",           "ocaml_unsafe_unroll",   "ocaml_unsafe_sr"),
+        ("OxCaml, on top of it, polls removed too",
+                                    "oxcaml_unsafe_sr",      "oxcaml_unsafe_sr_pollfree"),
+        ("OxCaml, both together vs shipped",
+                                    "oxcaml_unsafe_unroll",  "oxcaml_unsafe_sr_pollfree"),
+    ]),
+    ("flambda2 over the stock closure middle-end, same source", [
+        ("plain, bounds-checked",   "ocaml_safe_plain",      "oxcaml_safe_plain"),
+        ("unrolled, bounds-checked","ocaml_safe_unroll",     "oxcaml_safe_unroll"),
+        ("plain, -unsafe",          "ocaml_unsafe_plain",    "oxcaml_unsafe_plain"),
+        ("shipped vs shipped",      "ocaml_unsafe_unroll",   "oxcaml_unsafe_unroll"),
+    ]),
+]
+LW = max(len(lbl) for _, rows in EFFECTS for lbl, _, _ in rows)
+for title, rows in EFFECTS:
+    shown = [(lbl, paired(b, t)) for lbl, b, t in rows]
+    shown = [(lbl, r) for lbl, r in shown if r]
+    if not shown:
+        continue
+    print(f"\n  {title}:")
+    for lbl, (m, w, n) in shown:
+        print(f"    {lbl:{LW}s} {m:+7.1f}%   faster in {w}/{n} rounds")
 PY
   echo
 done
