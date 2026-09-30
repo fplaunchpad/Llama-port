@@ -34,7 +34,19 @@ REPEATS="${REPEATS:-3}"
 BUDGET="${BUDGET:-0.3}"
 SAMPLES="${SAMPLES:-200}"
 MODES="${MODES:-gen}"
-if [ "$PIN" = "-1" ]; then TASKSET=(); else TASKSET=(taskset -c "$PIN"); fi
+# CPU pinning keeps a sustained single-threaded run off an efficiency core mid-measurement,
+# which otherwise moves throughput by 2-3x. taskset is Linux-only; macOS has no equivalent
+# a shell can reach, so there we run unpinned and say so rather than failing.
+if [ "$PIN" = "-1" ]; then
+  TASKSET=(); PINNING="disabled (PIN=-1)"
+elif command -v taskset >/dev/null 2>&1; then
+  TASKSET=(taskset -c "$PIN"); PINNING="taskset cpu $PIN"
+else
+  TASKSET=(); PINNING="UNPINNED - no taskset on this platform"
+  echo "warning: taskset not found; running unpinned." >&2
+  echo "         Expect more variance. Close other load and prefer the paired" >&2
+  echo "         'rounds won' columns over the absolute tok/s figures." >&2
+fi
 
 CXXFLAGS_COMMON="-std=c++20 -fno-fast-math -ffp-contract=off"
 
@@ -120,6 +132,32 @@ MG_SR=1 OCAMLFLAGS="-O3 -unsafe -disable-poll-insertion" \
   OUT="$OUT/oxcaml_unsafe_sr_pollfree" bash impl/oxcaml/build.sh >/dev/null 2>&1 \
   && echo "  oxcaml_unsafe_sr_pollfree" || echo "  oxcaml_unsafe_sr_pollfree FAILED"
 
+# ---- OxCaml 5.4.0+ox : optimizations done IN THE COMPILER, not the source ---
+# Everything above varies the source and holds the compiler fixed at the pinned 5.2.0+ox
+# switch. These three hold the SOURCE fixed (the shipped kernel) and vary the COMPILER,
+# to price two passes added locally: strength reduction of `base + i`, and forming
+# interior pointers in loops that cannot reach the GC. Built only if those compilers are
+# present, so the matrix still runs on a machine that has not built them.
+#
+# MG_OCAMLOPT is essential here: impl/oxcaml/build.sh otherwise selects 5.2.0+ox
+# silently, and all three would be the same binary.
+# Paths are overridable so the compilers can live anywhere; see compiler-patches/README.md
+# for how to build them. Absent, these four rows are skipped and the rest of the matrix
+# runs normally.
+OX54_BASE="${MG_OX54_BASE:-$HOME/oxinstall-baseline/bin/ocamlopt.opt}"  # pristine 5.4.0+ox
+OX54_SR="${MG_OX54_SR:-$HOME/oxinstall-sr/bin/ocamlopt.opt}"            # + strength reduction
+OX54_IP="${MG_OX54_IP:-$HOME/oxsrc/_install/bin/ocamlopt.opt}"          # + interior pointers
+build_ox54 () {  # $1 = variant name, $2 = compiler, $3 = extra flags
+  [ -x "$2" ] || { echo "  $1 SKIPPED (no compiler at $2)"; return; }
+  MG_OCAMLOPT="$2" MG_UNROLL=1 OCAMLFLAGS="-O3 -unsafe $3" OUT="$OUT/$1" \
+    bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+    && echo "  $1" || echo "  $1 FAILED"
+}
+build_ox54 ox54_base     "$OX54_BASE" ""
+build_ox54 ox54_sr       "$OX54_SR"   ""
+build_ox54 ox54_ip_off   "$OX54_IP"   "-no-cmm-interior-pointers"
+build_ox54 ox54_ip       "$OX54_IP"   ""
+
 echo "  python       (one variant; its only change was a correctness fix)"
 echo
 
@@ -130,7 +168,8 @@ for v in cpp_O2_plain cpp_plain cpp_unroll rust_plain rust_unroll \
          oxcaml_unsafe_plain_pollfree oxcaml_unsafe_unroll_pollfree \
          oxcaml_unsafe_sr oxcaml_unsafe_sr_pollfree \
          ocaml_safe_plain ocaml_safe_unroll ocaml_unsafe_plain ocaml_unsafe_unroll \
-         ocaml_unsafe_sr; do
+         ocaml_unsafe_sr \
+         ox54_base ox54_sr ox54_ip_off ox54_ip; do
   [ -x "$OUT/$v" ] && VARIANTS+=("$v|$OUT/$v")
 done
 VARIANTS+=("python|python3 $ROOT/impl/python/infer.py")
@@ -168,7 +207,7 @@ PY
 echo
 
 for MODE in $MODES; do
-  echo "=== $MODE: $ROUNDS interleaved rounds, taskset cpu $PIN, budget ${BUDGET}s ==="
+  echo "=== $MODE: $ROUNDS interleaved rounds, $PINNING, budget ${BUDGET}s ==="
   : > "$OUT/t_$MODE.txt"
   for ((r=0; r<ROUNDS; r++)); do
     for e in "${VARIANTS[@]}"; do
@@ -251,6 +290,12 @@ EFFECTS = [
     ("cost of the GC safepoint poll (OxCaml only - stock ocamlopt has no such flag)", [
         ("OxCaml, plain kernel",    "oxcaml_unsafe_plain",   "oxcaml_unsafe_plain_pollfree"),
         ("OxCaml, unrolled kernel", "oxcaml_unsafe_unroll",  "oxcaml_unsafe_unroll_pollfree"),
+    ]),
+    ("compiler passes added locally (source fixed, compiler varies; 5.4.0+ox)", [
+        ("strength reduction, in the compiler", "ox54_base",   "ox54_sr"),
+        ("interior pointers (flag off -> on)",  "ox54_ip_off", "ox54_ip"),
+        ("interior pointers over plain SR",     "ox54_sr",     "ox54_ip"),
+        ("both, vs pristine 5.4.0+ox",          "ox54_base",   "ox54_ip"),
     ]),
     ("hand strength reduction of base + i (flambda2 will not do it)", [
         ("OxCaml",                  "oxcaml_unsafe_unroll",  "oxcaml_unsafe_sr"),

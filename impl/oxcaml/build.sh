@@ -25,7 +25,20 @@
 # to the shared source - see OPTIMIZATIONS.md.
 set -euo pipefail
 cd "$(dirname "$0")"
-eval "$(opam env --switch=5.2.0+ox 2>/dev/null)" || true
+
+# MG_OCAMLOPT names an ocamlopt binary directly, for benchmarking a locally built
+# compiler against the opam one. Without it the pinned 5.2.0+ox switch is used, and
+# that switch selection is silent - so anything measuring a modified compiler MUST set
+# this, or it will quietly build every "variant" with 5.2.0+ox and compare a binary
+# against itself.
+MG_OCAMLOPT="${MG_OCAMLOPT:-}"
+if [ -n "$MG_OCAMLOPT" ]; then
+  [ -x "$MG_OCAMLOPT" ] || { echo "MG_OCAMLOPT=$MG_OCAMLOPT is not executable" >&2; exit 1; }
+  OCAMLOPT="$MG_OCAMLOPT"
+else
+  eval "$(opam env --switch=5.2.0+ox 2>/dev/null)" || true
+  OCAMLOPT=ocamlopt
+fi
 
 OCAMLFLAGS="${OCAMLFLAGS:--O3 -unsafe}"
 MG_UNROLL="${MG_UNROLL:-1}"
@@ -111,14 +124,23 @@ open(p, "w").write(s[:start] + (plain if kernel == "plain" else sr) + s[end:])
 PY
 fi
 
-# keep the JSON self-describing
+# keep the JSON self-describing. Done in python, not `sed -i`: that flag takes a
+# mandatory backup suffix on BSD/macOS and none on GNU, so no single spelling works
+# on both, and the failure is silent corruption of the file rather than an error.
 case "$KERNEL" in
   plain)    DESC="ocamlopt (flambda2, plain linear)" ;;
   sr)       DESC="ocamlopt (flambda2, strength-reduced linear)" ;;
   *)        DESC="ocamlopt (flambda2, unrolled linear)" ;;
 esac
-sed -i "s/ocamlopt -O3 (flambda2); no fast-math equivalent exists in OCaml/$DESC/" "$WORK/main.ml"
+python3 - "$WORK/main.ml" "$DESC" <<'PY'
+import sys
+path, desc = sys.argv[1], sys.argv[2]
+old = "ocamlopt -O3 (flambda2); no fast-math equivalent exists in OCaml"
+s = open(path, encoding="utf-8").read()
+assert old in s, "runtime identity string not found; impl/oxcaml/main.ml moved"
+open(path, "w", encoding="utf-8").write(s.replace(old, desc))
+PY
 
 ABS_OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
-( cd "$WORK" && ocamlopt $OCAMLFLAGS -I +unix unix.cmxa main.ml -o "$ABS_OUT" )
-echo "built $ABS_OUT  (OCAMLFLAGS='$OCAMLFLAGS' kernel=$KERNEL)"
+( cd "$WORK" && "$OCAMLOPT" $OCAMLFLAGS -I +unix unix.cmxa main.ml -o "$ABS_OUT" )
+echo "built $ABS_OUT  (ocamlopt $("$OCAMLOPT" -version), OCAMLFLAGS='$OCAMLFLAGS' kernel=$KERNEL)"

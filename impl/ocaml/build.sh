@@ -147,13 +147,22 @@ open(p, "w").write(s[:start] + (plain if kernel == "plain" else sr) + s[end:])
 PY
 fi
 
-# keep the JSON self-describing
+# keep the JSON self-describing. Done in python, not `sed -i`: that flag takes a
+# mandatory backup suffix on BSD/macOS and none on GNU, so no single spelling works
+# on both, and the failure is silent corruption of the file rather than an error.
 case "$KERNEL" in
   plain)    DESC="ocamlopt (closure, plain linear)" ;;
   sr)       DESC="ocamlopt (closure, strength-reduced linear)" ;;
   *)        DESC="ocamlopt (closure, unrolled linear)" ;;
 esac
-sed -i "s/ocamlopt (stock upstream); no fast-math equivalent exists in OCaml/$DESC/" "$WORK/main.ml"
+python3 - "$WORK/main.ml" "$DESC" <<'PY'
+import sys
+path, desc = sys.argv[1], sys.argv[2]
+old = "ocamlopt (stock upstream); no fast-math equivalent exists in OCaml"
+s = open(path, encoding="utf-8").read()
+assert old in s, "runtime identity string not found; impl/ocaml/main.ml moved"
+open(path, "w", encoding="utf-8").write(s.replace(old, desc))
+PY
 
 ABS_OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 ( cd "$WORK" && ocamlopt $OCAMLFLAGS -I +unix unix.cmxa main.ml -o "$ABS_OUT" )
