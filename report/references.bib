@@ -1,0 +1,285 @@
+@misc{karpathy_microgpt,
+  author       = {Andrej Karpathy},
+  title        = {microgpt: a single-file, dependency-free {GPT} in pure {Python}},
+  year         = {2026},
+  note         = {Training and inference of a character-level GPT with a scalar autograd engine. The copy used in this project is \texttt{microgpt.py} in the repository root}
+}
+
+@misc{karpathy_makemore,
+  author       = {Andrej Karpathy},
+  title        = {makemore: \texttt{names.txt} dataset},
+  howpublished = {\url{https://github.com/karpathy/makemore}},
+  note         = {Commit 988aa59; 32,032 names}
+}
+
+@inproceedings{vaswani2017attention,
+  author    = {Ashish Vaswani and Noam Shazeer and Niki Parmar and Jakob Uszkoreit and Llion Jones and Aidan N. Gomez and {\L}ukasz Kaiser and Illia Polosukhin},
+  title     = {Attention Is All You Need},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {30},
+  year      = {2017}
+}
+
+@techreport{radford2019gpt2,
+  author      = {Alec Radford and Jeffrey Wu and Rewon Child and David Luan and Dario Amodei and Ilya Sutskever},
+  title       = {Language Models are Unsupervised Multitask Learners},
+  institution = {OpenAI},
+  year        = {2019}
+}
+
+@inproceedings{zhang2019rmsnorm,
+  author    = {Biao Zhang and Rico Sennrich},
+  title     = {Root Mean Square Layer Normalization},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {32},
+  year      = {2019}
+}
+
+@misc{oxcaml,
+  author       = {{Jane Street}},
+  title        = {{OxCaml}: Jane Street's extensions to {OCaml}},
+  howpublished = {\url{https://oxcaml.org} and \url{https://github.com/oxcaml/oxcaml}},
+  note         = {Release 5.4.0-ox7 (opam package \texttt{oxcaml-compiler.5.4.0-ox7}); main branch of 30 October 2026},
+  year         = {2026}
+}
+
+@article{sivaramakrishnan2020retrofitting,
+  author  = {K. C. Sivaramakrishnan and Stephen Dolan and Leo White and Sadiq Jaffer and Tom Kelly and Anmol Sahoo and Sudha Parimala and Atul Dhiman and Anil Madhavapeddy},
+  title   = {Retrofitting Parallelism onto {OCaml}},
+  journal = {Proceedings of the ACM on Programming Languages},
+  volume  = {4},
+  number  = {ICFP},
+  pages   = {113:1--113:30},
+  year    = {2020}
+}
+
+@book{minsky2022rwo,
+  author    = {Yaron Minsky and Anil Madhavapeddy},
+  title     = {Real World {OCaml}: Functional Programming for the Masses},
+  edition   = {2nd},
+  publisher = {Cambridge University Press},
+  year      = {2022},
+  note      = {Chapter ``Memory Representation of Values''}
+}
+
+@misc{ocaml_runtime,
+  author       = {{OCaml Contributors}},
+  title        = {{OCaml} runtime and native-code backend sources},
+  howpublished = {\url{https://github.com/ocaml/ocaml}},
+  year         = {2026}
+}
+
+@article{cocke1977strength,
+  author  = {John Cocke and Ken Kennedy},
+  title   = {An Algorithm for Reduction of Operator Strength},
+  journal = {Communications of the ACM},
+  volume  = {20},
+  number  = {11},
+  pages   = {850--856},
+  year    = {1977}
+}
+
+@incollection{allen1981strength,
+  author    = {Frances E. Allen and John Cocke and Ken Kennedy},
+  title     = {Reduction of Operator Strength},
+  booktitle = {Program Flow Analysis: Theory and Applications},
+  editor    = {Steven S. Muchnick and Neil D. Jones},
+  publisher = {Prentice-Hall},
+  pages     = {79--101},
+  year      = {1981}
+}
+
+@misc{llvm_passes,
+  author       = {{LLVM Project}},
+  title        = {{LLVM}'s Analysis and Transform Passes: \texttt{loop-reduce} (Loop Strength Reduction) and \texttt{indvars} (Canonicalize Induction Variables)},
+  howpublished = {\url{https://llvm.org/docs/Passes.html}},
+  year         = {2026}
+}
+
+@misc{jdk_stripmining,
+  author       = {{OpenJDK}},
+  title        = {{JDK-8186027}: {C2}: loop strip mining},
+  howpublished = {\url{https://bugs.openjdk.org/browse/JDK-8186027}},
+  note         = {Fixed in JDK 10; options \texttt{UseCountedLoopSafepoints} and \texttt{LoopStripMiningIter}},
+  year         = {2017}
+}
+
+@misc{graal_safepoints,
+  author       = {{Oracle}},
+  title        = {{GraalVM} compiler: \texttt{LoopSafepointEliminationPhase}},
+  howpublished = {\url{https://github.com/oracle/graal/blob/master/compiler/src/jdk.graal.compiler/src/jdk/graal/compiler/loop/phases/LoopSafepointEliminationPhase.java}},
+  year         = {2026}
+}
+
+@misc{ocaml_safepoints,
+  author       = {Sadiq Jaffer and Stephen Dolan and Damien Doligez and Xavier Leroy and Anmol Sahoo and Mark Shinwell},
+  title        = {Safepoints},
+  howpublished = {{OCaml} pull request \#10039, \url{https://github.com/ocaml/ocaml/pull/10039}},
+  note         = {Released in {OCaml} 4.13.0},
+  year         = {2021}
+}
+
+@misc{ghc_yields,
+  author       = {{GHC Team}},
+  title        = {{GHC} User's Guide: \texttt{-fomit-yields}},
+  howpublished = {\url{https://downloads.haskell.org/ghc/latest/docs/users_guide/using-optimisation.html}},
+  year         = {2026}
+}
+
+@book{aho2006dragon,
+  author    = {Alfred V. Aho and Monica S. Lam and Ravi Sethi and Jeffrey D. Ullman},
+  title     = {Compilers: Principles, Techniques, and Tools},
+  edition   = {2nd},
+  publisher = {Addison-Wesley},
+  year      = {2006}
+}
+
+@inproceedings{diwan1992compiler,
+  author    = {Amer Diwan and Eliot Moss and Richard Hudson},
+  title     = {Compiler Support for Garbage Collection in a Statically Typed Language},
+  booktitle = {Proceedings of the ACM SIGPLAN Conference on Programming Language Design and Implementation (PLDI)},
+  pages     = {273--282},
+  year      = {1992}
+}
+
+@misc{llvm_statepoints,
+  author       = {{LLVM Project}},
+  title        = {Garbage Collection Safepoints in {LLVM}},
+  howpublished = {\url{https://llvm.org/docs/Statepoints.html}},
+  year         = {2026}
+}
+
+@article{neumaier1974,
+  author  = {Arnold Neumaier},
+  title   = {Rundungsfehleranalyse einiger Verfahren zur Summation endlicher Summen},
+  journal = {Zeitschrift f{\"u}r Angewandte Mathematik und Mechanik},
+  volume  = {54},
+  number  = {1},
+  pages   = {39--51},
+  year    = {1974}
+}
+
+@misc{python312sum,
+  author       = {{Python Software Foundation}},
+  title        = {What's New in {Python} 3.12: \texttt{sum()} now uses {Neumaier} summation},
+  howpublished = {\url{https://docs.python.org/3/whatsnew/3.12.html}},
+  year         = {2023}
+}
+
+@article{marsaglia2003xorshift,
+  author  = {George Marsaglia},
+  title   = {Xorshift {RNGs}},
+  journal = {Journal of Statistical Software},
+  volume  = {8},
+  number  = {14},
+  pages   = {1--6},
+  year    = {2003}
+}
+
+@article{vigna2016xorshift,
+  author  = {Sebastiano Vigna},
+  title   = {An Experimental Exploration of {Marsaglia's} xorshift Generators, Scrambled},
+  journal = {ACM Transactions on Mathematical Software},
+  volume  = {42},
+  number  = {4},
+  pages   = {30:1--30:23},
+  year    = {2016}
+}
+
+@misc{fnv,
+  author       = {Glenn Fowler and Landon Curt Noll and Kiem-Phong Vo and Donald Eastlake and Tony Hansen},
+  title        = {The {FNV} Non-Cryptographic Hash Algorithm},
+  howpublished = {IETF Internet-Draft draft-eastlake-fnv},
+  year         = {2024}
+}
+
+@inproceedings{mytkowicz2009wrong,
+  author    = {Todd Mytkowicz and Amer Diwan and Matthias Hauswirth and Peter F. Sweeney},
+  title     = {Producing Wrong Data Without Doing Anything Obviously Wrong!},
+  booktitle = {Proceedings of the International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS)},
+  pages     = {265--276},
+  year      = {2009}
+}
+
+@inproceedings{georges2007rigorous,
+  author    = {Andy Georges and Dries Buytaert and Lieven Eeckhout},
+  title     = {Statistically Rigorous {Java} Performance Evaluation},
+  booktitle = {Proceedings of the ACM SIGPLAN Conference on Object-Oriented Programming, Systems, Languages, and Applications (OOPSLA)},
+  pages     = {57--76},
+  year      = {2007}
+}
+
+@misc{fog_tables,
+  author       = {Agner Fog},
+  title        = {Instruction Tables: Lists of Instruction Latencies, Throughputs and Micro-Operation Breakdowns for {Intel}, {AMD} and {VIA} {CPUs}},
+  howpublished = {\url{https://www.agner.org/optimize/}},
+  year         = {2024}
+}
+
+@misc{llamacpp,
+  author       = {Georgi Gerganov and contributors},
+  title        = {llama.cpp: {LLM} inference in {C/C++}},
+  howpublished = {\url{https://github.com/ggml-org/llama.cpp}},
+  year         = {2026}
+}
+
+@inproceedings{liu2024kivi,
+  author    = {Zirui Liu and Jiayi Yuan and Hongye Jin and Shaochen Zhong and Zhaozhuo Xu and Vladimir Braverman and Beidi Chen and Xia Hu},
+  title     = {{KIVI}: A Tuning-Free Asymmetric 2bit Quantization for {KV} Cache},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning (ICML)},
+  year      = {2024}
+}
+
+@inproceedings{xiao2024streamingllm,
+  author    = {Guangxuan Xiao and Yuandong Tian and Beidi Chen and Song Han and Mike Lewis},
+  title     = {Efficient Streaming Language Models with Attention Sinks},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024}
+}
+
+@misc{nx_oxcaml,
+  author       = {{Raven ML}},
+  title        = {nx-oxcaml: an {OxCaml} backend for the {Nx} numerical library},
+  howpublished = {\url{https://github.com/raven-ml/nx-oxcaml}},
+  year         = {2026}
+}
+
+@misc{crypto_study,
+  author       = {{FP Launchpad}},
+  title        = {oxcaml-crypto-study: performance engineering of cryptographic primitives in {OxCaml}},
+  howpublished = {\url{https://github.com/fplaunchpad/oxcaml-crypto-study}},
+  note         = {Revision 0093d926, 2026-10-15},
+  year         = {2026}
+}
+
+@techreport{rfc8439,
+  author      = {Yoav Nir and Adam Langley},
+  title       = {{ChaCha20} and {Poly1305} for {IETF} Protocols},
+  type        = {RFC},
+  number      = {8439},
+  institution = {IETF},
+  year        = {2018}
+}
+
+@misc{llamaport_repo,
+  author       = {Aadi Srivastava},
+  title        = {Llama-port: {microgpt} in {Python}, {C++}, {Rust}, {OCaml} and {OxCaml}, with a uniform benchmark},
+  howpublished = {\url{https://github.com/fplaunchpad/Llama-port/tree/ugrc2-report}},
+  note         = {Tag \texttt{ugrc2-report}; run data and scripts in \texttt{report/data}},
+  year         = {2026}
+}
+
+@misc{oxcaml_pr,
+  author       = {Aadi Srivastava},
+  title        = {Interior pointers and poll-free counted loops in {Cmm}},
+  howpublished = {Branch \texttt{ugrc2-rebased}, commit \texttt{91acf6b}, \url{https://github.com/AadiSrivastava05/oxcaml/tree/91acf6b7e9921529ac0d96506abcf6032f31ed4a}},
+  note         = {Earlier revision under review as pull request \#1, \url{https://github.com/AadiSrivastava05/oxcaml/pull/1}},
+  year         = {2026}
+}
+
+@misc{polybench,
+  author       = {Louis-No{\"e}l Pouchet and Tomofumi Yuki},
+  title        = {{PolyBench/C} 4.2: The Polyhedral Benchmark Suite},
+  howpublished = {\url{https://sourceforge.net/projects/polybench/}},
+  year         = {2016}
+}

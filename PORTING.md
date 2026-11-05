@@ -4,13 +4,12 @@
 and JSON shape. Read sections 2–7 of it first. This file is the other half: **what actually
 goes wrong**, in the order it is likely to bite you.
 
-Every trap listed here was found the hard way while writing the C++, Rust and OCaml ports.
-Seven of them were real defects that shipped and had to be fixed. Two survived a full benchmark run
-looking perfectly correct, because the outputs happened to agree anyway.
+Each trap below is one the C++, Rust and OCaml ports had to handle. Several leave the
+generated text unchanged, because a discrete decision (which token gets sampled) absorbs
+small floating-point differences.
 
-The headline lesson: **agreeing outputs are not proof of a correct port.** Floating-point
-divergence usually hides until it doesn't, and a discrete decision (which token got sampled)
-absorbs small errors silently. Verify the arithmetic, not just the answer.
+The lesson: **agreeing outputs are not proof of a correct port.** Verify the arithmetic,
+not just the answer.
 
 ---
 
@@ -121,8 +120,7 @@ The generation hash covers the whole generated corpus, so it **changes** with `-
 
 ### Trap 1 — your language's `sum()` is probably not a plain running total
 
-**This is the one that will get you.** It cost this project a wrong headline number for
-several hours, and the wrong number *looked* right.
+This is the trap most likely to go unnoticed, because the result still looks right.
 
 Modern standard libraries silently use better-than-naive summation:
 
@@ -132,8 +130,8 @@ Modern standard libraries silently use better-than-naive summation:
 - Anything named `fsum`, `Kahan`, `Neumaier`, `accurate_sum` is compensated by construction.
 
 Measured on this checkpoint: switching Python from `sum(genexp)` to an explicit loop changed
-**141 of 214** dot products and moved `weights_sum` by 23 ulp (5e-15 relative). It slipped
-through a 1e-12 agreement tolerance for the entire first round of benchmarking.
+**141 of 214** dot products and moved `weights_sum` by 23 ulp (5e-15 relative), well
+inside a 1e-12 agreement tolerance.
 
 **Litmus test.** In your language:
 
@@ -196,12 +194,12 @@ for each doc:
     total += local            # <- one add per document, not per token
 ```
 
-This bit the Rust port: its perplexity path was right, but its `check.first3_nll` fingerprint
-folded differently and disagreed at 1e-16. It passed the 1e-9 tolerance and would have sat
-there indefinitely as a latent inconsistency.
+A port whose perplexity path groups this way but whose `check.first3_nll` fingerprint
+folds per token disagrees with itself at 1e-16: inside the 1e-9 tolerance, so the
+inconsistency stays latent.
 
-**Fix.** Route both `check` and `ppl` through one shared `score_doc` helper, as all three
-reference implementations now do.
+**Fix.** Route both `check` and `ppl` through one shared `score_doc` helper, as all five
+implementations do.
 
 ---
 
@@ -217,9 +215,8 @@ if x <= 0.0 { x = 0.0 }  // NaN -> NaN     <- wrong
 `NaN > 0.0` and `NaN <= 0.0` are *both* false, so the first form replaces NaN and the second
 preserves it. `-0.0` behaves the same in both (yields `+0.0`).
 
-This bit the Rust port. It is latent — dot products of finite weights cannot produce NaN
-here — but it is a real semantic divergence, and it will surface the moment someone feeds in
-a checkpoint with a NaN weight.
+The difference is latent here (dot products of finite weights cannot produce NaN), but
+it is a real semantic divergence, and a checkpoint with a NaN weight exposes it.
 
 **Fix.** Write it as the ternary, matching the contract literally.
 
@@ -263,9 +260,9 @@ wrong:
 3. **Seed 0** must fall back to `0x9E3779B97F4A7C15`, or the generator is stuck at zero
    forever.
 
-Also: **actually honour the `--seed` flag everywhere.** The Python reference had `Rng(1234)`
-hardcoded in its check path, so at any non-default seed the harness reported a false RNG
-mismatch against a perfectly correct C++ port.
+Also: **honour the `--seed` flag in every code path.** A seed hardcoded in one path (the
+`check` path, say) shows up as an RNG mismatch at any non-default seed, against ports that
+are correct.
 
 **Detect.** The four golden draws in section 2.
 
@@ -289,9 +286,9 @@ selections that only show up as a hash mismatch on long runs.
 
 ### Trap 9 — how you strip whitespace from the corpus
 
-Python's `str.strip()` removes whitespace from **both** ends. The C++ port originally stripped
-only trailing characters, so a document with a leading space tokenized as a vocab miss and
-crashed. Latent on `data/val.txt` (LF-only lowercase ASCII), real for any other corpus.
+Python's `str.strip()` removes whitespace from **both** ends. Stripping only trailing
+characters makes a document with a leading space tokenize as a vocabulary miss. Latent on
+`data/val.txt` (LF-only lowercase ASCII), real for any other corpus.
 
 **Fix.** Strip `\r`, `\n`, space and tab from both ends. Note the reference implementations
 use exactly that ASCII set, deliberately — a full Unicode-whitespace `trim()` is a superset
@@ -314,9 +311,9 @@ and will diverge on exotic input.
 
 ### Trap 11 — flags, and benchmarking a flag instead of a language
 
-The first three-way run had C++ at `-O2` while Rust used its release default of
-`opt-level = 3`. That made Rust look ~20% faster than C++. It was the flag. At matched O3 the
-two are within ~3%.
+Rust's release profile is `opt-level = 3`. Built at `-O2`, C++ measures the flag rather
+than the language: `-O3` is worth +15.3% to C++ on the plain kernel in run W
+(`cpp_O2_plain` -> `cpp_plain`).
 
 **Fix.** Match optimization intent across implementations, and state the flags in your JSON
 `build` field so the comparison is auditable.
@@ -333,9 +330,9 @@ two are within ~3%.
 - **No `NaN`/`Infinity` literals** — they are not valid JSON.
 - **Integer widths.** C++ `std::stoi` narrows `--seed` to `int`; a seed above 2^31 would
   wrap. Parse into a 64-bit type.
-- **Paths.** Windows `os.path.relpath` throws across drive letters. The Python reference
-  crashed on any weights file outside the repo drive until the shape sweep — which writes to
-  a temp dir on `C:` — caught it.
+- **Paths.** Windows `os.path.relpath` throws across drive letters, so a weights file on
+  another drive (the shape sweep writes to a temp directory) must be handled with absolute
+  paths.
 
 ---
 
@@ -357,9 +354,9 @@ in `bench/run.py`:
 ),
 ```
 
-Then add it to `IMPLS` in `tools/test_shapes.py` too, so the shape sweep covers it, and to
-the build+run lists in `tools/bench_wsl.sh` (the uniform timing run) and
-`tools/bench_variants.sh` (the optimization matrix).
+Then add it to `IMPLS` in `tools/test_shapes.py` too, so the shape sweep covers it, and add
+its builds to the registry in `bench/variants.py` (one row per build, with a group and a
+concept), which is all `bench/bench.py` needs to build, check and time it.
 
 **If your port needs a compiler that only runs elsewhere**, follow what the two OCaml entries
 do: route `run` and `build` through `wsl.exe`, set `path_map` so the paths handed to the
@@ -403,7 +400,7 @@ which is larger than most language differences you might be trying to measure:
 
 **The cross-check that tells you the timing is sound:** `gen` and `ppl` throughput must agree
 within an implementation, because they run the same forward pass. When they disagree, the
-measurement is broken — that disagreement is what exposed both timing bugs in this project.
+measurement is at fault.
 
 ---
 
@@ -411,12 +408,11 @@ measurement is broken — that disagreement is what exposed both timing bugs in 
 
 Do not read a green suite as proof of a perfect port.
 
-- ~~One platform per language.~~ **Now tested.** The same C++ source built with g++ 15.2 on
-  Windows (UCRT libm) and g++ 14.2 on Linux (glibc libm) produces **bit-identical** output:
-  same perplexity to the last digit, same generated text, same checksums. Both OCaml ports,
-  which only run on Linux here, agree with all three. So cross-platform agreement holds in
-  practice on x86-64, at least for these two libm implementations. Cross-platform *timing*
-  remains meaningless — build and time everything in one environment.
+- **Platforms are covered for two libm implementations only.** The same C++ source built
+  with g++ 15.2 on Windows (UCRT libm) and g++ 14.2 on Linux (glibc libm) produces
+  **bit-identical** output, and the OCaml ports, built on Linux, agree with both. Other
+  libm implementations are untested. Cross-platform *timing* is not meaningful: build and
+  time everything in one environment.
 - **The `block_size` truncation branch is never exercised.** The longest name is 15
   characters, so `n = min(block_size, len(tokens)-1)` never actually truncates. A bug in that
   branch is invisible in all five implementations.
@@ -434,89 +430,38 @@ comparison and a corpus containing a document long enough to trigger truncation.
 
 ## 7. Performance notes
 
-Correctness first — but once your port agrees, here is where the time actually goes and what
-is safe to optimize. Measured by instrumenting the Rust port with `rdtsc` region counters.
+Correctness first. Once a port agrees, these are the things that decided speed here; the
+measured effect of each is in README.md (run W).
 
-**Where the cycles go** (generation, `n_layer=1`, `n_embd=16`, average context 3.5). Measured
-with `tools/profile_regions.py`, which will reproduce this split for C++ and both OCaml builds
-and show region by region where each one loses:
-
-| region | share | work (MACs) | cyc/op | verdict |
-|---|---:|---:|---:|---|
-| mlp (fc1 + relu + fc2) | 41% | 2144 | 1.38 | efficient |
-| qkv linear | 17% | 800 | 1.61 | efficient |
-| temp + softmax + sample | 14% | 135 | 6.8 | libm-bound (27 `exp` calls) |
-| attention | 12% | 112 | 7.9 | libm + indexing |
-| lm_head linear | 7% | 432 | 1.32 | efficient |
-| wo linear | 6% | 256 | 1.65 | efficient |
-| embed + rmsnorm | 3% | 48 | 3.75 | libm-bound (1 `pow`) |
-
-Two structural facts fall out of this:
-
-- **The `linear` kernels look near the floor, but are not.** They run at ~1.3–1.7 cycles per
-  multiply-accumulate. A 16-element dot product is a chain of 16 *dependent* f64 adds at ~4
-  cycles of latency each, so a single chain would cost 4 cyc/MAC; landing at 1.4 means the
-  compiler is *partly* interleaving independent output rows. It turns out not to be doing
-  that fully: unrolling four output rows **by hand** is worth **+19% in C++, +5% in Rust,
-  +54% under OxCaml and +221% under the stock OCaml compiler**. An earlier version of this
-  document claimed the compilers had already extracted this and no more was available — that
-  was wrong, and measuring it is what proved it. The ~46x spread across those four backends is
-  also the answer to "how much does my compiler matter": entirely, right up until you write
-  the loop out by hand yourself. See OPTIMIZATIONS.md.
-- **~20–30% of runtime is libm** — roughly 3 `pow` and 41 `exp` calls per token, all of them
-  mandated by the contract (`pow` in rmsnorm, `exp` in every softmax). That is a hard floor
-  unless the contract changes.
-
-**Three fixes that were worth 7.5% in Rust**, all verified bit-identical:
-
-| fix | gain | why |
-|---|---:|---|
-| Hoist the per-layer KV cache slices out of the inner loops | +4.0% | `cache[li][t*E+hs+j]` per element costs an outer bounds check, a pointer chase and an inner bounds check. Take the slice once, outside. |
-| `linear` over `out.iter_mut().zip(w.d.chunks_exact(cols))` | +3.7% | Removes the per-output-row slice and index bounds checks that `w.row(o)` / `out[o] = ..` incur. |
-| Hoist `pow(head_dim, 0.5)` to load time | +1.3% | It is a constant, and it was being recomputed once per layer per token. |
-
-The first two are specific to bounds-checked languages — the C++ port already used raw
-pointers in both places. The third was slack in *both* ports.
-
-**If your language has no interior pointers, `linear` will cost you.** C++ and Rust walk the
-weight matrix with four raw pointers into the middle of the allocation plus one shared
-offset, advancing all four output rows with a single `add`. A precise tracing GC usually
-cannot allow that — it must find the header of the block any pointer refers to, and the
-header sits immediately before the data, so a pointer into the middle of an array is not a
-valid value. OCaml therefore re-derives `base + index` for every row on every iteration: 8
-integer instructions where C++ spends 1, which is the single largest line in the budget
-below. Measured per 4 multiply-accumulates, the OCaml inner loop is 23 instructions against
-C++'s 15, and both spend exactly 8 of them on arithmetic. If you hit this, the fix is to
-stop the loop needing a live index at all — see OPTIMIZATIONS.md for the `cols`-specialized
-full unroll, where constant offsets fold into the addressing mode and the arithmetic
-disappears entirely.
-
-**Do not assume the gap is SIMD.** It is the obvious explanation and it was wrong here:
-rebuilding the C++ port with `-fno-tree-vectorize` — removing every packed instruction —
-costs it only **6.2%**, and un-vectorized C++ is still 1.60x faster than OxCaml. Vector
-width was worth far less than the scalar bookkeeping around it. Measure before you optimize
-for it.
-
-**If you are porting to a language with a tracing GC, price its safepoints.** OCaml 5 emits
-a poll on every loop back edge it cannot prove short — the `linear` inner loop allocates
-nothing, so it would otherwise contain no safepoint at all. Building without them
-(`ocamlopt -disable-poll-insertion`) is worth **+15.2%** on the shipped OxCaml binary. The
-trap is *why*: overwriting the same poll instructions with NOPs in the linked binary gains
-**+0.1%**, so the cost is not the two instructions. A value cannot live in `%r11` across a
-poll, and in the register-starved unrolled kernel losing that register forces a stack spill
-reloaded every iteration. Measure the constraint, not the instruction count — and note the
-poll-free binary is a diagnostic, not something to ship, since nothing can preempt it.
-`tools/bench_polls.sh` and OPTIMIZATIONS.md have the full treatment.
-
-**What does not work.** `-C target-cpu=native` / `-march=native` made things **slower**:
-−9.8% for Rust, −6.5% for C++, on this machine. The reduction cannot be vectorized without
-reassociation, so wider registers buy nothing while still costing setup and, on some parts,
-frequency. Measure before assuming.
-
-**Still on the table**, if you want to push further: flatten the KV cache from a
-vector-of-vectors to one flat allocation indexed by `li*block_size*E + t*E`; manually unroll
-`linear` across output rows to expose more instruction-level parallelism; skip the
-logits→probs copy in the scoring path.
+- **Where the time goes.** `linear` dominates: the MLP, the q/k/v and output projections
+  and the vocabulary projection. The softmax, sampling and rmsnorm paths are bound by the
+  libm `exp` and `pow` calls the contract requires (about 41 `exp` and 3 `pow` per token).
+  `tools/profile_regions.py` splits the forward pass into the same seven regions in C++
+  and both OCaml builds, with the same time-stamp counter.
+- **Instruction-level parallelism.** A dot product is a chain of dependent additions.
+  Computing four output rows at once (four independent accumulators, one load of `x[i]`
+  per four rows) keeps each row's summation order, so the output is unchanged, and was
+  worth +22% to C++, +4% to Rust, +55% to OxCaml and +222% to stock OCaml: the less a
+  compiler already overlapped the plain loop, the more the unroll gives.
+- **Bounds checks.** In a bounds-checked language, take slices once outside the hot loops
+  and iterate in a form the compiler can prove in bounds. Rust reached C++'s speed with
+  three such changes: hoisting the per-layer KV-cache slices, iterating `linear` with
+  `chunks_exact(cols)`, and precomputing the attention scale. OCaml's `-unsafe` removes
+  the checks outright.
+- **Interior pointers.** C++ and Rust walk a matrix with four row pointers and one shared
+  offset. A language whose precise GC cannot represent a pointer into the middle of an
+  array rebuilds `base + i` for every row on every iteration instead (8 of OCaml's 23
+  inner-loop instructions per four multiply-adds, against C++'s 15). Carrying the row
+  indices by hand (`MG_SR=1`) recovers part of it; the compiler passes in
+  [`compiler-patches/`](compiler-patches/README.md) recover it without a source change.
+- **Do not assume the gap is SIMD.** GCC's auto-vectoriser is worth only +8.9% to C++
+  here, so the like-for-like baseline for a scalar port is `cpp_novec`
+  (`-fno-tree-vectorize`), not the shipped C++ build.
+- **Safepoints.** A garbage-collected language may poll on every loop back edge; the cost
+  is less the poll's instructions than what the compiler cannot do across it (README.md,
+  section 4).
+- **`-march=native` / `-C target-cpu=native` does not help**: the reduction cannot be
+  vectorised without reassociation, so wider registers buy nothing.
 
 ### Is any of this parallelizable?
 
@@ -565,6 +510,5 @@ Your port is done when:
 - [ ] `gen` and `ppl` throughput agree within ~2% for your implementation
 - [ ] your build flags are recorded in the JSON `build` field
 
-And one last thing: when your port agrees on everything, that is evidence, not proof. Both
-adversarial code reviews of these implementations found real defects **after** the benchmark
-was reporting full agreement. Have someone — or something — read your arithmetic.
+When your port agrees on everything, that is evidence, not proof: some of the traps above
+leave every output unchanged. Have someone read your arithmetic against section 3.

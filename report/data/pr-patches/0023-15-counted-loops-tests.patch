@@ -1,0 +1,477 @@
+From 071b172df20ebfd3d85fca323967cb0bc8d13cd8 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:30 +0000
+Subject: [PATCH 23/24] 15-counted-loops-tests
+
+---
+ .../tests/backend/counted_loops/decisions.ml  |  98 +++++++++++
+ .../backend/counted_loops/decisions.output    |  12 ++
+ oxcaml/tests/backend/counted_loops/dune       | 153 ++++++++++++++++++
+ .../backend/counted_loops/kernels.expected    |   1 +
+ oxcaml/tests/backend/counted_loops/kernels.ml |  77 +++++++++
+ .../backend/counted_loops/tripcap.expected    |   7 +
+ oxcaml/tests/backend/counted_loops/tripcap.ml |  46 ++++++
+ .../counted_loops/tripcap_decisions.output    |   8 +
+ 8 files changed, 402 insertions(+)
+ create mode 100755 oxcaml/tests/backend/counted_loops/decisions.ml
+ create mode 100755 oxcaml/tests/backend/counted_loops/decisions.output
+ create mode 100755 oxcaml/tests/backend/counted_loops/dune
+ create mode 100755 oxcaml/tests/backend/counted_loops/kernels.expected
+ create mode 100755 oxcaml/tests/backend/counted_loops/kernels.ml
+ create mode 100755 oxcaml/tests/backend/counted_loops/tripcap.expected
+ create mode 100755 oxcaml/tests/backend/counted_loops/tripcap.ml
+ create mode 100755 oxcaml/tests/backend/counted_loops/tripcap_decisions.output
+
+diff --git a/oxcaml/tests/backend/counted_loops/decisions.ml b/oxcaml/tests/backend/counted_loops/decisions.ml
+new file mode 100755
+index 0000000000..151dd9ae11
+--- /dev/null
++++ b/oxcaml/tests/backend/counted_loops/decisions.ml
+@@ -0,0 +1,98 @@
++(* -dcounted-loops decisions for the loop shapes the counted-loop matcher
++   distinguishes. One function per shape; the expected output is
++   decisions.output. *)
++
++(* A [for] loop: the bound is a tagged value shifted right, so [i <= n] cannot
++   wrap. Proved without a check. *)
++let[@inline never] for_up (a : int array) n =
++  let s = ref 0 in
++  for i = 0 to n - 1 do
++    s := !s + Array.unsafe_get a i
++  done;
++  !s
++
++(* [downto] is the mirror image. *)
++let[@inline never] for_down (a : int array) n =
++  let s = ref 0 in
++  for i = n - 1 downto 0 do
++    s := !s + Array.unsafe_get a i
++  done;
++  !s
++
++(* [i < n] stepping by 16 wraps if [n] is near [max_int]: entry check. *)
++let[@inline never] lt_step16 (a : int array) n =
++  let i = ref 0 and s = ref 0 in
++  while !i < n do
++    s := !s + Array.unsafe_get a (!i land 15);
++    i := !i + 16
++  done;
++  !s
++
++(* [i <> n] stepping by 2 never ends if [n - i] is odd: entry check. *)
++let[@inline never] ne_step2 (a : int array) n =
++  let i = ref 0 and s = ref 0 in
++  while !i <> n do
++    s := !s + Array.unsafe_get a (!i land 15);
++    i := !i + 2
++  done;
++  !s
++
++(* [i <= max_int] never fails: never counted. *)
++let[@inline never] le_max (a : int array) =
++  let i = ref 0 and s = ref 0 in
++  while !i <= max_int && !s >= 0 do
++    s := !s + Array.unsafe_get a (!i land 15);
++    i := !i + 1
++  done;
++  !s
++
++(* An allocation in the body: declined. *)
++let[@inline never] allocates n =
++  let l = ref [] in
++  for i = 0 to n - 1 do
++    l := i :: !l
++  done;
++  !l
++
++(* An inner loop whose check depends only on values bound outside the outer
++   loop: lifted to the outer loop's entry. *)
++let[@inline never] nest_lifted (a : int array) rows n =
++  let s = ref 0 in
++  for r = 0 to rows - 1 do
++    let m = n + 1 in
++    let j = ref 0 in
++    while !j < m do
++      s := !s + Array.unsafe_get a ((r + !j) land 15);
++      j := !j + 16
++    done
++  done;
++  !s
++
++(* An inner check that reads the outer counter: not liftable. *)
++let[@inline never] nest_dependent (a : int array) rows n =
++  let s = ref 0 in
++  for r = 0 to rows - 1 do
++    let m = n + r in
++    let j = ref 0 in
++    while !j < m do
++      s := !s + Array.unsafe_get a (!j land 15);
++      j := !j + 16
++    done
++  done;
++  !s
++
++(* No test dominates the back edge that steps the counter. *)
++let[@inline never] no_guard (a : int array) n flag =
++  let i = ref 0 and go = ref true and s = ref 0 in
++  while !go do
++    if !i < n || flag then i := !i + 1 else go := false;
++    s := !s + Array.unsafe_get a (!i land 15)
++  done;
++  !s
++
++(* A spin on an atomic: GC-free, but it is a loop the counted-loop proof
++   cannot apply to (no counter). *)
++let[@inline never] spin (x : int Atomic.t) =
++  while Atomic.get x = 0 do
++    Domain.cpu_relax ()
++  done
+diff --git a/oxcaml/tests/backend/counted_loops/decisions.output b/oxcaml/tests/backend/counted_loops/decisions.output
+new file mode 100755
+index 0000000000..e6b7f925fd
+--- /dev/null
++++ b/oxcaml/tests/backend/counted_loops/decisions.output
+@@ -0,0 +1,12 @@
++counted-loops camlDecisions__for_up_0_10_code : counted, no entry check
++counted-loops camlDecisions__for_down_1_11_code : counted, no entry check
++counted-loops camlDecisions__lt_step16_2_12_code : counted, entry check
++counted-loops camlDecisions__ne_step2_3_13_code : counted, entry check
++counted-loops camlDecisions__le_max_4_14_code : not counted: no counter with a dominating guard
++counted-loops camlDecisions__allocates_5_15_code : not counted: a GC point inside
++counted-loops camlDecisions__nest_lifted_6_16_code : counted, entry check
++counted-loops camlDecisions__nest_lifted_6_16_code : counted, entry check (1 inner check(s) lifted)
++counted-loops camlDecisions__nest_dependent_7_17_code : counted, entry check
++counted-loops camlDecisions__nest_dependent_7_17_code : not counted: an inner loop's entry check cannot be lifted
++counted-loops camlDecisions__no_guard_8_18_code : not counted: no counter with a dominating guard
++counted-loops camlDecisions__spin_9_19_code : not counted: no counter with a dominating guard
+diff --git a/oxcaml/tests/backend/counted_loops/dune b/oxcaml/tests/backend/counted_loops/dune
+new file mode 100755
+index 0000000000..6143ddc4fe
+--- /dev/null
++++ b/oxcaml/tests/backend/counted_loops/dune
+@@ -0,0 +1,153 @@
++; Counted loops (-cmm-counted-loops): which loops are made poll-free, and
++; that the kernels the pointer passes rewrite inside them compute the same
++; results.
++
++(rule
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (targets decisions.output.corrected)
++ (deps decisions.ml)
++ (action
++  (with-stderr-to
++   decisions.output.corrected
++   (run
++    %{bin:ocamlopt.opt}
++    %{deps}
++    -c
++    -O3
++    -cmm-counted-loops
++    -dcounted-loops
++    -color
++    never
++    -w
++    -a))))
++
++(rule
++ (alias runtest)
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (deps decisions.output decisions.output.corrected)
++ (action
++  (diff decisions.output decisions.output.corrected)))
++
++(rule
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (targets kernels_counted.exe)
++ (deps kernels.ml)
++ (action
++  (run
++   %{bin:ocamlopt.opt}
++   %{deps}
++   -O3
++   -cmm-counted-loops
++   -o
++   kernels_counted.exe)))
++
++(rule
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (targets kernels.output)
++ (deps kernels_counted.exe)
++ (action
++  (with-stdout-to
++   kernels.output
++   (setenv
++    OCAMLRUNPARAM
++    s=4k
++    (run ./kernels_counted.exe)))))
++
++(rule
++ (alias runtest)
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (deps kernels.expected kernels.output)
++ (action
++  (diff kernels.expected kernels.output)))
++
++; -cmm-counted-loops-max-trips: which loops get the trip-count check, and that
++; capped loops compute the same results through either version.
++
++(rule
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (targets tripcap_decisions.output.corrected)
++ (deps tripcap.ml)
++ (action
++  (with-stderr-to
++   tripcap_decisions.output.corrected
++   (run
++    %{bin:ocamlopt.opt}
++    %{deps}
++    -c
++    -O3
++    -cmm-counted-loops
++    -cmm-counted-loops-max-trips
++    1000
++    -dcounted-loops
++    -color
++    never
++    -w
++    -a))))
++
++(rule
++ (alias runtest)
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (deps tripcap_decisions.output tripcap_decisions.output.corrected)
++ (action
++  (diff tripcap_decisions.output tripcap_decisions.output.corrected)))
++
++(rule
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (targets tripcap.exe)
++ (deps tripcap.ml)
++ (action
++  (run
++   %{bin:ocamlopt.opt}
++   %{deps}
++   -O3
++   -cmm-counted-loops
++   -cmm-counted-loops-max-trips
++   1000
++   -o
++   tripcap.exe)))
++
++(rule
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (targets tripcap.output)
++ (deps tripcap.exe)
++ (action
++  (with-stdout-to
++   tripcap.output
++   (run ./tripcap.exe))))
++
++(rule
++ (alias runtest)
++ (enabled_if
++  (and
++   (= %{context_name} "main")
++   (= %{architecture} "amd64")))
++ (deps tripcap.expected tripcap.output)
++ (action
++  (diff tripcap.expected tripcap.output)))
+diff --git a/oxcaml/tests/backend/counted_loops/kernels.expected b/oxcaml/tests/backend/counted_loops/kernels.expected
+new file mode 100755
+index 0000000000..f12dfe5e23
+--- /dev/null
++++ b/oxcaml/tests/backend/counted_loops/kernels.expected
+@@ -0,0 +1 @@
++3089742587593043412
+diff --git a/oxcaml/tests/backend/counted_loops/kernels.ml b/oxcaml/tests/backend/counted_loops/kernels.ml
+new file mode 100755
+index 0000000000..baff6e254e
+--- /dev/null
++++ b/oxcaml/tests/backend/counted_loops/kernels.ml
+@@ -0,0 +1,77 @@
++(* Kernels that the pointer passes rewrite inside counted loops, run with the
++   GC kept busy (a young copy of every array, Gc.compact between kernels).
++   The output must not depend on -cmm-counted-loops; kernels.expected was
++   produced without it. *)
++
++let o x = Sys.opaque_identity x
++
++let h = ref 0L
++
++let mix x = h := Int64.add (Int64.mul !h 1000003L) x
++
++let[@inline never] matvec (m : float array) (v : float array) (out : float array)
++    rows cols =
++  for r = 0 to rows - 1 do
++    let b = r * cols in
++    let s = ref 0.0 in
++    for c = 0 to cols - 1 do
++      s := !s +. (m.(b + c) *. v.(c))
++    done;
++    out.(r) <- !s
++  done
++
++let[@inline never] matvec4 (m : float array) (v : float array)
++    (out : float array) rows cols =
++  let r = ref 0 in
++  while !r + 3 < rows do
++    let b0 = !r * cols in
++    let b1 = b0 + cols and b2 = b0 + (2 * cols) and b3 = b0 + (3 * cols) in
++    let s0 = ref 0.0 and s1 = ref 0.0 and s2 = ref 0.0 and s3 = ref 0.0 in
++    for c = 0 to cols - 1 do
++      let x = v.(c) in
++      s0 := !s0 +. (m.(b0 + c) *. x);
++      s1 := !s1 +. (m.(b1 + c) *. x);
++      s2 := !s2 +. (m.(b2 + c) *. x);
++      s3 := !s3 +. (m.(b3 + c) *. x)
++    done;
++    out.(!r) <- !s0;
++    out.(!r + 1) <- !s1;
++    out.(!r + 2) <- !s2;
++    out.(!r + 3) <- !s3;
++    r := !r + 4
++  done;
++  while !r < rows do
++    let s = ref 0.0 in
++    for c = 0 to cols - 1 do
++      s := !s +. (m.((!r * cols) + c) *. v.(c))
++    done;
++    out.(!r) <- !s;
++    incr r
++  done
++
++let[@inline never] shifted (a : int array) b n =
++  let s = ref 0 in
++  let i = ref 0 in
++  while !i < n do
++    s := !s + a.(b + !i) + a.(!i + b + 1);
++    i := !i + 3
++  done;
++  !s
++
++let () =
++  let rows = o 19 and cols = o 37 in
++  let m0 = Array.init (rows * cols) (fun i -> float_of_int ((i * 7919) mod 1009) /. 7.0) in
++  let v0 = Array.init cols (fun i -> float_of_int (i - 20) /. 3.0) in
++  for rep = 0 to 20 do
++    let m = Array.map (fun x -> x +. float_of_int rep) m0 in
++    let v = Array.copy v0 in
++    let out = Array.make rows 0.0 in
++    matvec m v out rows cols;
++    Array.iter (fun x -> mix (Int64.bits_of_float x)) out;
++    Gc.compact ();
++    matvec4 m v out rows cols;
++    Array.iter (fun x -> mix (Int64.bits_of_float x)) out;
++    let a = Array.init 1000 (fun i -> i * rep) in
++    mix (Int64.of_int (shifted a (o 7) (o 900)))
++  done;
++  Printf.printf "%Ld\n" !h
+diff --git a/oxcaml/tests/backend/counted_loops/tripcap.expected b/oxcaml/tests/backend/counted_loops/tripcap.expected
+new file mode 100755
+index 0000000000..cb52541237
+--- /dev/null
++++ b/oxcaml/tests/backend/counted_loops/tripcap.expected
+@@ -0,0 +1,7 @@
++0: 0x0p+0 0 0 0
++1: 0x0p+0 0 1 3
++999: 0x1.e6d14p+18 31248 499500 1498500
++1000: 0x1.e7cbp+18 31248 500500 1501500
++1001: 0x1.e8c5p+18 31248 501501 1504503
++5000: 0x1.3192ep+21 154560 2504164 7512492
++100000: 0x1.855758p+25 3142608 51032400 153097200
+diff --git a/oxcaml/tests/backend/counted_loops/tripcap.ml b/oxcaml/tests/backend/counted_loops/tripcap.ml
+new file mode 100755
+index 0000000000..248d7a98a6
+--- /dev/null
++++ b/oxcaml/tests/backend/counted_loops/tripcap.ml
+@@ -0,0 +1,46 @@
++(* -cmm-counted-loops-max-trips: which loops get the trip-count check, and
++   that the capped loops compute the same results whether they run their
++   poll-free version (short) or their polled copy (long). *)
++
++let[@inline never] sum (a : float array) n =
++  let s = ref 0. in
++  for i = 0 to n - 1 do
++    s := !s +. Array.unsafe_get a (i land 1023)
++  done;
++  !s
++
++let[@inline never] step16 (a : int array) n =
++  let s = ref 0 and j = ref 0 in
++  while !j < n do
++    s := !s + Array.unsafe_get a (!j land 1023);
++    j := !j + 16
++  done;
++  !s
++
++let[@inline never] down (a : int array) n =
++  let s = ref 0 in
++  for i = n downto 1 do
++    s := !s + Array.unsafe_get a (i land 1023)
++  done;
++  !s
++
++let[@inline never] nest (a : int array) m n =
++  let s = ref 0 in
++  for r = 0 to m - 1 do
++    for c = 0 to n - 1 do
++      s := !s + Array.unsafe_get a ((r + c) land 1023)
++    done
++  done;
++  !s
++
++let () =
++  let fa = Array.init 1024 float_of_int and ia = Array.init 1024 (fun i -> i) in
++  let o = Sys.opaque_identity in
++  List.iter
++    (fun n ->
++      Printf.printf "%d: %h %d %d %d\n" n
++        (sum fa (o n))
++        (step16 ia (o n))
++        (down ia (o n))
++        (nest ia (o 3) (o n)))
++    [0; 1; 999; 1000; 1001; 5000; 100000]
+diff --git a/oxcaml/tests/backend/counted_loops/tripcap_decisions.output b/oxcaml/tests/backend/counted_loops/tripcap_decisions.output
+new file mode 100755
+index 0000000000..41f30a38cc
+--- /dev/null
++++ b/oxcaml/tests/backend/counted_loops/tripcap_decisions.output
+@@ -0,0 +1,8 @@
++counted-loops camlTripcap__sum_0_8_code : counted, entry check (trip cap)
++counted-loops camlTripcap__step16_1_9_code : counted, entry check (trip cap)
++counted-loops camlTripcap__down_2_10_code : counted, entry check (trip cap)
++counted-loops camlTripcap__nest_3_11_code : counted, entry check (trip cap)
++counted-loops camlTripcap__nest_3_11_code : not counted: an inner loop's entry check cannot be lifted
++counted-loops camlTripcap__entry : not counted: a GC point inside
++counted-loops camlTripcap__entry : counted, entry check (trip cap)
++counted-loops camlTripcap__entry : counted, entry check (trip cap)
+-- 
+2.47.3
+

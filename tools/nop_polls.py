@@ -6,8 +6,9 @@ Overwrite OCaml's GC safepoint polls with NOPs, in an already-linked binary.
 
 Why in-binary rather than a compiler flag
 -----------------------------------------
-`ocamlopt -disable-poll-insertion` also exists, and tools/bench_polls.sh runs it as a
-cross-check. But it lets the compiler re-optimise everything downstream: different
+`ocamlopt -disable-poll-insertion` also exists, and the *_pollfree variants of
+bench/bench.py build with it as a cross-check (the *_pollnop variants run this tool).
+But it lets the compiler re-optimise everything downstream: different
 register allocation, different scheduling, different code layout. That measures
 "polls removed PLUS whatever the compiler then did differently".
 

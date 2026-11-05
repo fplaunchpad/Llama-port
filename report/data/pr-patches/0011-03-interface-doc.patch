@@ -1,0 +1,78 @@
+From 56f84ed8c5ac4f439f96a9c21ec222f9395ea694 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:29 +0000
+Subject: [PATCH 11/24] 03-interface-doc
+
+---
+ backend/cmm_strength_reduction.mli | 54 +++++++++++++++++++-----------
+ 1 file changed, 34 insertions(+), 20 deletions(-)
+
+diff --git a/backend/cmm_strength_reduction.mli b/backend/cmm_strength_reduction.mli
+index e88a6b7eae..c6676a6f25 100755
+--- a/backend/cmm_strength_reduction.mli
++++ b/backend/cmm_strength_reduction.mli
+@@ -25,27 +25,41 @@
+  * DEALINGS IN THE SOFTWARE.                                                  *
+  ******************************************************************************)
+ 
+-(** Strength reduction of derived induction variables.
++(** Loop optimisations on [Cmm], run on each function just before instruction
++    selection.
+ 
+     A loop reaches [Cmm] as a [Ccatch Recursive] whose handler parameters are
+-    the loop-carried values. When such a handler has an integer parameter [i]
+-    that every exit either steps by a constant or resets to a duplicable value,
+-    and the handler body computes [b + i] for some [b] bound outside the loop,
+-    this pass carries [b + i] in a new handler parameter instead of rebuilding
+-    it on every iteration: the entry edges pass [b + i0] and the stepping edges
+-    pass [j + stride].
+-
+-    OCaml code has to write this shape. The garbage collector locates a block's
+-    header from any pointer it scans, and the header sits immediately before the
+-    data, so an interior pointer is not a representable value and an array walk
+-    cannot hoist a moving pointer the way C can. The index form is forced by the
+-    language, so the arithmetic it implies is worth removing.
+-
+-    Deliberately out of scope: non-constant strides, sums of two induction
+-    variables, products ([b * i]), reassociation, any loop whose header is not
+-    syntactically a [Ccatch Recursive], and any invariant not already bound
+-    outside the loop (nothing is hoisted). Only the first eligible parameter of
+-    a handler is treated as an induction variable. See the implementation for
+-    the exact conditions. *)
++    the loop-carried values. On each such loop, innermost first:
++
++    - Strength reduction (on by default, [-no-cmm-strength-reduction]): a sum
++      [b + i] of a loop-invariant [b] and an affine function [i] of a counter
++      that every exit steps by a constant or resets is carried in a new loop
++      parameter, so the addition leaves the loop.
++
++    - Interior pointers ([-no-cmm-interior-pointers]): in a loop that cannot
++      reach a safepoint, the invariant part of an array address is formed once
++      before the loop, as a derived pointer ([Addr]).
++
++    - Invariant strides ([-no-cmm-invariant-strides], [-no-cmm-carried-pointers]):
++      a value [start + stride * counter] with a loop-invariant [stride], possibly
++      a derived pointer, is carried across the loop and stepped by one addition.
++      Rows of unboxed vector arrays get the same treatment.
++
++    - Loop-invariant code motion ([-no-cmm-licm]): pure, total integer bindings
++      whose operands are bound outside the loop are bound before it, when that
++      does not add a live range the loop cannot afford.
++
++    - Counted loops ([-cmm-counted-loops], off by default): a GC-free loop whose
++      termination is proved (exactly, in 64-bit wrapping arithmetic; otherwise
++      behind a check on entry and a polled copy of the loop) loses its
++      back-edge poll and polls on its exits instead, and is then given the
++      pointer passes even when the unit polls. [-cmm-unchecked-loops] does the
++      same without the proof, at the cost of liveness only.
++
++    A derived pointer is never live across a safepoint: the pointer passes
++    only act where none can occur (a unit compiled without polling, or a
++    counted loop), and the emitter rejects an [Addr] live at a frame
++    descriptor ("bad GC root"). [-dcounted-loops] prints each counted-loop
++    decision. See the implementation for the exact conditions. *)
+ 
+ val fundecl : Cmm.fundecl -> Cmm.fundecl
+-- 
+2.47.3
+

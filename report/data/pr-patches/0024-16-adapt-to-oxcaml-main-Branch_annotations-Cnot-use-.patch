@@ -1,0 +1,149 @@
+From 692d2f2b17985108b66774b21b7879fc43b681a0 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:30 +0000
+Subject: [PATCH 24/24] 16-adapt-to-oxcaml-main (Branch_annotations, Cnot,
+ -use-ssa)
+
+---
+ backend/cfg/cfg_compare.ml        |  6 ++++-
+ backend/cmm_strength_reduction.ml | 45 ++++++++++++++++++++++---------
+ 2 files changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/backend/cfg/cfg_compare.ml b/backend/cfg/cfg_compare.ml
+index a2373aa886..6e50067dd9 100644
+--- a/backend/cfg/cfg_compare.ml
++++ b/backend/cfg/cfg_compare.ml
+@@ -818,7 +818,11 @@ let compare ~old_cfg ~new_cfg ppf =
+              the SSA pipeline tracks phantom lets. *)
+           fun_phantom_lets = _;
+           allowed_to_be_irreducible = old_allowed_to_be_irreducible;
+-          register_locations_are_set = _ (* not set at this pipeline stage *)
++          register_locations_are_set = _ (* not set at this pipeline stage *);
++          (* Marked by [Cfg_selectgen] for counted loops only; the SSA path
++             never runs them ([Cmm_strength_reduction] turns them off under
++             -use-ssa), so there is nothing to compare. *)
++          bounded_loop_headers = _
+         } =
+       old_cfg
+     in
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index 7d02d8d6a9..5379a87729 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -48,10 +48,23 @@ let map_subexpressions f (expr : expression) : expression =
+   | Ctuple exprs -> Ctuple (List.map f exprs)
+   | Cop (op, args, dbg) -> Cop (op, List.map f args, dbg)
+   | Csequence (e1, e2) -> Csequence (f e1, f e2)
+-  | Cifthenelse (cond, dbg_cond, ifso, dbg_ifso, ifnot, dbg_ifnot) ->
+-    Cifthenelse (f cond, dbg_cond, f ifso, dbg_ifso, f ifnot, dbg_ifnot)
++  | Cifthenelse
++      (cond, dbg_cond, ann_ifso, ifso, dbg_ifso, ann_ifnot, ifnot, dbg_ifnot) ->
++    Cifthenelse
++      ( f cond,
++        dbg_cond,
++        ann_ifso,
++        f ifso,
++        dbg_ifso,
++        ann_ifnot,
++        f ifnot,
++        dbg_ifnot )
+   | Cswitch (sel, index, cases, dbg) ->
+-    Cswitch (f sel, index, Array.map (fun (case, dbg) -> f case, dbg) cases, dbg)
++    Cswitch
++      ( f sel,
++        index,
++        Array.map (fun (case, dbg, ann) -> f case, dbg, ann) cases,
++        dbg )
+   | Ccatch (flag, handlers, body) ->
+     Ccatch
+       ( flag,
+@@ -674,7 +687,7 @@ let operation_is_safepoint (op : operation) =
+   | Cclz | Cctz | Cpopcnt | Cprefetch _ | Ccmpi _ | Caddv | Cadda | Cnegf _
+   | Cabsf _ | Caddf _ | Csubf _ | Cmulf _ | Cdivf _ | Cpackf32
+   | Creinterpret_cast _ | Cstatic_cast _ | Ccmpf _ | Craise _
+-  | Cprobe_is_enabled _ | Copaque | Ctuple_field _ | Cdls_get | Ctls_get
++  | Cprobe_is_enabled _ | Cnot | Copaque | Ctuple_field _ | Cdls_get | Ctls_get
+   | Cdomain_index | Cpause ->
+     false
+ 
+@@ -724,13 +737,13 @@ let outbound_parts ~inside ~tail body =
+     | Csequence (e1, e2) ->
+       walk ~tail:false e1;
+       walk ~tail e2
+-    | Cifthenelse (cond, _, ifso, _, ifnot, _) ->
++    | Cifthenelse (cond, _, _, ifso, _, _, ifnot, _) ->
+       walk ~tail:false cond;
+       walk ~tail ifso;
+       walk ~tail ifnot
+     | Cswitch (sel, _, cases, _) ->
+       walk ~tail:false sel;
+-      Array.iter (fun (case, _) -> walk ~tail case) cases
++      Array.iter (fun (case, _, _) -> walk ~tail case) cases
+     | Ccatch (_, handlers, body) ->
+       walk ~tail body;
+       List.iter
+@@ -832,10 +845,10 @@ let rec has_tail_call expr =
+   | Cname_for_debugger (_, body)
+   | Csequence (_, body) ->
+     has_tail_call body
+-  | Cifthenelse (_, _, ifso, _, ifnot, _) ->
++  | Cifthenelse (_, _, _, ifso, _, _, ifnot, _) ->
+     has_tail_call ifso || has_tail_call ifnot
+   | Cswitch (_, _, cases, _) ->
+-    Array.exists (fun (case, _) -> has_tail_call case) cases
++    Array.exists (fun (case, _, _) -> has_tail_call case) cases
+   | Ccatch (_, handlers, body) ->
+     has_tail_call body
+     || List.exists
+@@ -2130,7 +2143,7 @@ let counted_guard ~defs ~duplicated ~int_vars ~expr (handler : static_handler) =
+           | Cexit (Lbl l, args, _) when Static_label.equal l label ->
+             per_edge := active :: !per_edge;
+             List.iter (walk active) args
+-          | Cifthenelse (cond, _, if_true, _, if_false, _) -> (
++          | Cifthenelse (cond, _, _, if_true, _, _, if_false, _) -> (
+             walk active cond;
+             match classify cond with
+             | Some (affine, cmp, b) ->
+@@ -2386,8 +2399,10 @@ let add_slow_path ~(original : static_handler) ~index ~pre node =
+         (Cifthenelse
+            ( pre (List.nth vars index),
+              dbg,
++             Branch_annotations.default,
+              Cexit (Lbl label, vars @ extra, traps),
+              dbg,
++             Branch_annotations.default,
+              Cexit (Lbl slow.label, vars, traps),
+              dbg ))
+     | _ -> map_subexpressions branch expr
+@@ -2918,8 +2933,14 @@ let fundecl (fundecl : fundecl) =
+      safepoint: either the whole unit is compiled without polling, or the loop
+      is a counted one. [Cfg_selectgen] admits an [Addr] in a [Ccatch] register
+      under exactly the same condition. *)
++  (* The bounded-header marks and the [Addr] rule for [Ccatch] registers live
++     in [Cfg_selectgen]; the SSA path ([-use-ssa]) has neither, so nothing
++     that relies on them is done there. *)
++  let ssa = !Oxcaml_flags.use_ssa in
+   let carry_pointers =
+-    !Oxcaml_flags.cmm_carried_pointers && polls_are_impossible fundecl
++    !Oxcaml_flags.cmm_carried_pointers
++    && polls_are_impossible fundecl
++    && not ssa
+   in
+   let in_poll_error_function =
+     is_poll_error fundecl
+@@ -2932,10 +2953,10 @@ let fundecl (fundecl : fundecl) =
+   let counted_loops =
+     !Oxcaml_flags.cmm_counted_loops
+     && (polls_are_inserted fundecl || in_poll_error_function)
+-    && Arch.size_int = 8 && Nativeint.size = 64
++    && Arch.size_int = 8 && Nativeint.size = 64 && not ssa
+   in
+   let unchecked_loops =
+-    !Oxcaml_flags.cmm_unchecked_loops && polls_are_inserted fundecl
++    !Oxcaml_flags.cmm_unchecked_loops && polls_are_inserted fundecl && not ssa
+   in
+   if
+     not
+-- 
+2.47.3
+

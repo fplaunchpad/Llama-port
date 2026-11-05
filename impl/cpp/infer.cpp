@@ -290,7 +290,7 @@ struct Model {
 
 // MG_UNROLL selects between the two shapes of the same arithmetic, so the benchmark
 // can measure the optimization rather than just assert it. Build with -DMG_UNROLL=0
-// for the plain form. Both produce identical output; see OPTIMIZATIONS.md.
+// for the plain form. Both produce identical output; README.md has the measured effect.
 #ifndef MG_UNROLL
 #define MG_UNROLL 1
 #endif

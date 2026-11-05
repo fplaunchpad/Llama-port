@@ -1,72 +1,114 @@
-# Compiler patches
+# Compiler passes: the Cmm loop optimisations
 
-Two optimization passes added to the OxCaml compiler (`github.com/oxcaml/oxcaml`, the
-flambda-backend fork of OCaml). They are **optional** — the benchmark matrix runs without
-them and simply omits four rows.
+The compiler half of this project is one patch series on my OxCaml fork. The version
+measured in the report (run W) is branch
+[`ugrc2-rebased`](https://github.com/AadiSrivastava05/oxcaml/tree/ugrc2-rebased) at
+commit `91acf6b7e9921529ac0d96506abcf6032f31ed4a`: `oxcaml/oxcaml` main at
+`327965f0e72292605600a3c5d9a7bf50c59b345a` (30 October 2026) plus 24 patches, which are
+also in [`report/data/pr-patches/`](../report/data/pr-patches/). Pull request
+[AadiSrivastava05/oxcaml#1](https://github.com/AadiSrivastava05/oxcaml/pull/1) (branch
+`interior-pointers`, based on main at `c52688875`, 15 September 2026) shows an earlier
+revision: its eight commits correspond to the first eight patches of the series.
 
-| patch | what it does | measured |
-|---|---|---|
-| `0001-Strength-reduce-derived-induction-variables-in-Cmm-loops` | carries `base + i` in a loop parameter instead of rebuilding it every iteration | **+11.4%**, 9/9 rounds |
-| `0002-Form-interior-pointers-into-array-rows-in-loops-that-cannot-reach-the-GC` | hoists an interior (`Addr`) pointer per array row so four rows share one index register | **+10.7%**, 9/9 rounds |
+This directory holds patches 0001 to 0004 of that earlier revision, on `c52688875`. They
+build the `ox54_*` ladder compilers, one compiler per pass.
 
-Together: **+23.9%** over the unpatched compiler, on identical source, with byte-identical
-program output. Both are behind flags (`-no-cmm-strength-reduction`,
-`-no-cmm-interior-pointers`) so each can be switched off for an A/B on one binary.
+All passes live in one new file, `backend/cmm_strength_reduction.ml`, and run on Cmm
+before instruction selection. The other files they touch are the flag definitions
+(`driver/oxcaml_args.ml`, `driver/oxcaml_flags.ml`), instruction selection
+(`backend/cfg_selectgen.ml`, which must accept a derived pointer in a loop-carried
+register) and poll placement (`backend/cfg/cfg_polling.ml`, `cfg_simplify.ml`, which must
+leave a counted loop's back edge alone).
 
-Why they exist: flambda2 has no loop optimizations at all — no strength reduction, no
-LICM, no induction-variable analysis. OCaml also forbids interior pointers in general,
-because its precise GC must find a block's header from any pointer it scans and the header
-sits immediately before the data. Patch 2 forms them only in loops that provably contain
-no safepoint, where no collection can occur and so nothing is ever scanned.
+## One concept per patch
 
-## Applying
+Patch numbers are those of [`report/data/pr-patches/`](../report/data/pr-patches/).
 
-Both apply on upstream commit `c52688875424f836c3a4aa8d3c0f9840543a57e9`
-(`main`, 2026-09-15). Patch 2 applies on top of patch 1.
+| patch | concept | flag (default) | measured by (variants, `bench/variants.py`) |
+|---|---|---|---|
+| 0001 | strength reduction of derived induction variables: carry `base + i` as a loop parameter | `-[no-]cmm-strength-reduction` (on) | `ox54_base` -> `ox54_sr`; `pr_c_off` -> `pr_c_sr` |
+| 0002 | interior pointers: one hoisted row address (`Addr`) per array row, one shared index, in loops that cannot reach the GC | `-[no-]cmm-interior-pointers` (on) | `ox54_sr` -> `ox54_ip`; `ox54_ip_off` -> `ox54_ip`; `pr_c_sr` -> `pr_c_ip` |
+| 0003 | invariant-stride induction variables: carry the row pointers across the row loop (stride `cols`, not a constant) | `-[no-]cmm-invariant-strides` (on); `-[no-]cmm-carried-pointers` (on) | `ox54_ip` -> `ox54_ivs`; `ox54_ivs_noptr` -> `ox54_ivs` |
+| 0004 | loop-invariant code motion, register-neutral: hoists only where the operands die, so it declines on microgpt (identical code) | `-[no-]cmm-licm` (on) | `ox54_ivs` -> `ox54_licm` |
+| 0005 | one gate for interior and carried pointers (per function, honouring `[@poll error]`); a cost model for LICM's hoists | no new flag | part of every `pr_*` build |
+| 0006 | counted loops: a GC-free loop proved to terminate polls on its exits instead of its back edge, so the pointer passes apply with safepoints on; generalised address analysis (noalloc builtins, untagged vector indices) | `-cmm-counted-loops` (off); `-dcounted-loops` prints each decision | `pr_off` -> `pr_counted`; `pr_all` -> `pr_counted`; `pr_counted_noptr` -> `pr_counted` |
+| 0007 | unchecked loops: the same without the termination proof (loss of liveness possible, opt-in) | `-cmm-unchecked-loops` (off) | `pr_counted` -> `pr_unchecked` |
+| 0008 | unchecked loops can cost liveness only, never change a result; the `-no-cmm-*-pointers` flags apply inside counted loops | (as 0007) | `pr_unchecked`, `pr_counted_noptr` |
+| 0009-0024 | follow-ups: caps on the analyses, `[@poll error]` handling, a loop dump, a trip cap, a size budget for versioned loops, tests, and adaptation to the 30 October main branch | `-dcmm-loops`; `-cmm-counted-loops-max-trips N` (off) | every `pr_*` build |
+
+The four passes of patches 1 to 4 are on by default and switched off one at a time with
+the `-no-` flags (for strength reduction and interior pointers, the report checks that
+switching the pass off gives code byte-identical to the compiler without it). Counted and
+unchecked loops are off unless asked for. With safepoints
+on (the release configuration), interior and carried pointers can only form inside
+counted or unchecked loops, because a derived pointer may not be live across a poll; the
+backend's `bad GC root` check turns any mistake there into a compile-time error.
+
+## The compiler configurations in run W
+
+| family | source | configured with | install (default path) | variants |
+|---|---|---|---|---|
+| ladder | `c52688875` + patches 1..k of this directory, k = 0..4 | `--enable-flambda2` (no poll insertion) | `~/oxinstall-baseline`, `-sr`, `-ip`, `-ivs`, `-licm` | `ox54_*` |
+| pull request | `327965f0e` + the 24 patches (commit `91acf6b`) | `--enable-middle-end=flambda2 --enable-stack-checks --enable-poll-insertion --enable-multidomain --disable-warn-error` | `~/oxinstall-pr-latest` | `pr_*` |
+| release | opam package `oxcaml-compiler.5.4.0-ox7`, unpatched | as its opam recipe | `~/oxinstall-ox7` | `oxcaml_*` |
+
+The ladder isolates each pass on unchanged source with no polls in any loop (report
+Sections 8-10). The pull-request compiler is configured like the release, with a
+poll on every loop back edge, and flags select the configuration (report Sections 11-15).
+`ocamlopt -config` reports `poll_insertion: false` for the ladder and `true` for the
+pull-request compiler. The `oxcaml52_*` variants use the previous release, opam switch
+`5.2.0+ox`.
+
+## Building a compiler
+
+Linux x86-64 only. The bootstrap compiler must itself be an OxCaml 5.4 (the tree uses
+labelled tuples, `Char.Ascii` and `Format.utf_8_scalar_width`); `dune >= 3.23.0` and
+`menhir.20231231` come from an ordinary opam switch.
 
 ```bash
-git clone https://github.com/oxcaml/oxcaml
-cd oxcaml
-git checkout -b patched c52688875424f836c3a4aa8d3c0f9840543a57e9
-git am /path/to/llamaport/compiler-patches/0001-*.patch
-git am /path/to/llamaport/compiler-patches/0002-*.patch
+git clone https://github.com/oxcaml/oxcaml && cd oxcaml
+# the pull-request compiler of run W
+git remote add fork https://github.com/AadiSrivastava05/oxcaml
+git fetch fork ugrc2-rebased && git checkout 91acf6b7e9921529ac0d96506abcf6032f31ed4a
+#   or: git checkout -b pr 327965f0e72292605600a3c5d9a7bf50c59b345a
+#       git am /path/to/llamaport/report/data/pr-patches/00*.patch
+# ladder compiler k instead:
+#   git checkout -b ladder c52688875424f836c3a4aa8d3c0f9840543a57e9
+#   git am /path/to/llamaport/compiler-patches/000[1-k]-*.patch
+
+export PATH=$HOME/oxinstall/bin:$HOME/.opam/5.4.0/bin:$PATH   # bootstrap OxCaml, then dune + menhir
+tools/autogen
+./configure --enable-middle-end=flambda2 --enable-stack-checks --enable-poll-insertion \
+            --enable-multidomain --disable-warn-error --prefix="$HOME/oxinstall-pr-latest"
+#   ladder: ./configure --enable-flambda2 --prefix="$HOME/oxinstall-sr"   (etc.)
+make -j"$(nproc)" _install
 ```
 
-## Building
+## Pointing the benchmark at the compilers
 
-Linux x86-64 only — OxCaml does not target macOS or native Windows. Needs a bootstrap
-OCaml 5.4.0 on `PATH`, plus `menhir.20231231` and `dune >= 3.23.0` (and
-`ocamlformat.0.29.0` if you intend to run `make check-fmt`).
+`bench/bench.py` looks for the compilers at the paths above and skips the variants of
+any it does not find. Other locations are set with:
 
 ```bash
-eval "$(opam env --switch=5.4.0 --set-switch)"
-tools/autogen                       # exits 1 on autoconf warnings; still writes configure
-./configure --enable-flambda2 --prefix="$HOME/oxinstall-patched"
-make -j"$(nproc)" _install          # _install, not install
+export MG_OX_RELEASE=/path/to/5.4.0-ox7/bin/ocamlopt.opt   # oxcaml_*
+export MG_OX54_BASE=/path/to/unpatched/bin/ocamlopt.opt   # ox54_base
+export MG_OX54_SR=...     # patch 1         ox54_sr
+export MG_OX54_IP=...     # patches 1-2     ox54_ip, ox54_ip_off
+export MG_OX54_IVS=...    # patches 1-3     ox54_ivs, ox54_ivs_noptr
+export MG_OX54_LICM=...   # patches 1-4     ox54_licm
+export MG_OX_PR=...       # all 24 patches, poll insertion on: every pr_* variant
+python3 bench/bench.py --concept pass_sr,pass_ip,pass_ivs,pass_licm,safepoints,counted
 ```
 
-Expect roughly 35 minutes for a first build.
+`python3 bench/bench.py --show pr_counted` prints the exact build command of a variant.
 
-## Pointing the benchmark at them
+## Testing
 
-`tools/bench_variants.sh` reads three optional paths. Set whichever you have:
-
-```bash
-export MG_OX54_BASE=$HOME/oxinstall-baseline/bin/ocamlopt.opt   # pristine, no patches
-export MG_OX54_SR=$HOME/oxinstall-sr/bin/ocamlopt.opt           # patch 1 only
-export MG_OX54_IP=$HOME/oxinstall-patched/bin/ocamlopt.opt      # patches 1 + 2
-bash tools/bench_variants.sh
-```
-
-To get all four `ox54_*` rows you need three builds: unpatched, patch 1, patches 1+2. The
-fourth row (`ox54_ip_off`) is the patches-1+2 compiler run with
-`-no-cmm-interior-pointers`, which reproduces the patch-1 compiler exactly — that is what
-makes the interior-pointer comparison single-variable.
-
-## Status
-
-Not upstreamed, not submitted. Patch 2 currently only fires when GC polls are disabled
-(`-disable-poll-insertion`, or a build configured `poll_insertion: false`), because a poll
-on a loop's back edge is itself a safepoint. In a stock build no loop is poll-free, so it
-would not fire. Making it useful by default needs either strip-mining the loop so the
-poll-free region is bounded, or derived-pointer tracking in frame tables.
+Report Section 12 gives the full account. The upstream OxCaml test suite on the
+pull-request compiler, configured as above (155 tests skipped in each mode): the
+unpatched compiler and the default flags both pass 2,818 tests with no failures;
+`-cmm-counted-loops`, forced onto every test through `OCAMLPARAM`, fails only the two
+`[@poll error]` tests; `-cmm-unchecked-loops` fails 18 (16 that need a loop to reach a
+safepoint to be preempted, 2 thread-local storage). Every microgpt build in run W
+reproduces the reference output (hash `0xae6c6ffbd8f5b02c`, perplexity
+`10.789614873329409`).

@@ -3,6 +3,9 @@
 # cloner's core.autocrlf setting.
 *.sh text eol=lf
 
+# Patches are applied with `git am` on Linux; CRLF endings would break them.
+*.patch text eol=lf
+
 # The weight file is binary - never translate line endings inside it, and do not try
 # to diff it as text.
 *.bin binary

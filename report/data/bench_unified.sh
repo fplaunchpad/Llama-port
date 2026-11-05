@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# Optimization-wise benchmark: every <language>_<optimization> variant, built and timed
+# together in one Linux environment.
+#
+#   wsl -d Debian -- bash tools/bench_variants.sh     (run from the repo root)
+#
+# tools/bench_wsl.sh compares the five shipped ports against each other. This one opens
+# each port up and compares its optimization levels, so the numbers in OPTIMIZATIONS.md
+# can be re-measured rather than taken on trust.
+#
+# Both OCaml compilers get the full {safe, unsafe} x {plain, unrolled} grid rather than
+# a single ladder. Two reasons: -unsafe and the unroll interact (the unrolled kernel has
+# four times as many bounds checks to elide), and holding the source fixed across the
+# two compilers turns the oxcaml-vs-ocaml rows into a clean flambda2-vs-closure figure.
+#
+# OxCaml additionally gets two *_pollfree builds, which drop the GC safepoint poll. Those
+# are diagnostic, not shippable - see the comment on them below, and tools/bench_polls.sh
+# for the full treatment of what a poll actually costs and why.
+#
+# Every variant must produce byte-identical output. A variant that does not is a bug,
+# and the script says so instead of quietly ranking it.
+#
+# Env knobs: PIN (default 0, -1 disables), ROUNDS, REPEATS, BUDGET, SAMPLES, MODES.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+ROOT="$(pwd)"
+OUT=${OUTDIR:-/tmp/mgu}
+rm -rf "$OUT" && mkdir -p "$OUT"
+source "$HOME/.cargo/env" 2>/dev/null || true
+
+PIN="${PIN:-0}"
+ROUNDS="${ROUNDS:-9}"
+REPEATS="${REPEATS:-3}"
+BUDGET="${BUDGET:-0.3}"
+SAMPLES="${SAMPLES:-200}"
+MODES="${MODES:-gen}"
+# CPU pinning keeps a sustained single-threaded run off an efficiency core mid-measurement,
+# which otherwise moves throughput by 2-3x. taskset is Linux-only; macOS has no equivalent
+# a shell can reach, so there we run unpinned and say so rather than failing.
+if [ "$PIN" = "-1" ]; then
+  TASKSET=(); PINNING="disabled (PIN=-1)"
+elif command -v taskset >/dev/null 2>&1; then
+  TASKSET=(taskset -c "$PIN"); PINNING="taskset cpu $PIN"
+else
+  TASKSET=(); PINNING="UNPINNED - no taskset on this platform"
+  echo "warning: taskset not found; running unpinned." >&2
+  echo "         Expect more variance. Close other load and prefer the paired" >&2
+  echo "         'rounds won' columns over the absolute tok/s figures." >&2
+fi
+
+CXXFLAGS_COMMON="-std=c++20 -fno-fast-math -ffp-contract=off"
+
+echo "=== building variants ==="
+
+# ---- C++ : optimization level, and the 4-way unroll -------------------------
+g++ -O2 $CXXFLAGS_COMMON -DMG_UNROLL=0 -o "$OUT/cpp_O2_plain"  impl/cpp/infer.cpp 2>/dev/null \
+  && echo "  cpp_O2_plain" || echo "  cpp_O2_plain FAILED"
+g++ -O3 $CXXFLAGS_COMMON -DMG_UNROLL=0 -o "$OUT/cpp_plain"     impl/cpp/infer.cpp 2>/dev/null \
+  && echo "  cpp_plain" || echo "  cpp_plain FAILED"
+g++ -O3 $CXXFLAGS_COMMON                -o "$OUT/cpp_unroll"   impl/cpp/infer.cpp 2>/dev/null \
+  && echo "  cpp_unroll   (shipped)" || echo "  cpp_unroll FAILED"
+g++ -O3 $CXXFLAGS_COMMON -fno-tree-vectorize -o "$OUT/cpp_novec"  impl/cpp/infer.cpp 2>/dev/null \
+  && echo "  cpp_novec    (same kernel, vectorizer off: the like-for-like baseline)" \
+  || echo "  cpp_novec FAILED"
+
+# ---- Rust : the unroll feature ---------------------------------------------
+if command -v cargo >/dev/null 2>&1; then
+  CARGO_TARGET_DIR="$OUT/rs_plain" cargo build --release --no-default-features \
+      --manifest-path impl/rust/Cargo.toml >/dev/null 2>&1 \
+    && cp "$OUT/rs_plain/release/microgpt_infer" "$OUT/rust_plain" && echo "  rust_plain" \
+    || echo "  rust_plain FAILED"
+  CARGO_TARGET_DIR="$OUT/rs_unroll" cargo build --release \
+      --manifest-path impl/rust/Cargo.toml >/dev/null 2>&1 \
+    && cp "$OUT/rs_unroll/release/microgpt_infer" "$OUT/rust_unroll" && echo "  rust_unroll  (shipped)" \
+    || echo "  rust_unroll FAILED"
+else
+  echo "  rust SKIPPED (no cargo here)"
+fi
+
+# ---- OxCaml : bounds checks, and the 4-way unroll ---------------------------
+# The full 2x2: {safe, unsafe} x {plain, unrolled}. safe_unroll is not a step on the
+# way to anything shipped - it is there so the cost of -unsafe can be read off at BOTH
+# unroll levels. Bounds checks and the unroll are not independent: the unrolled kernel
+# does four indexed loads per iteration instead of one, so it has four times as many
+# checks to pay for, and the two effects have to be measured together to be believed.
+MG_UNROLL=0 OCAMLFLAGS="-O3"         OUT="$OUT/oxcaml_safe_plain"     bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_safe_plain" || echo "  oxcaml_safe_plain FAILED"
+MG_UNROLL=1 OCAMLFLAGS="-O3"         OUT="$OUT/oxcaml_safe_unroll"    bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_safe_unroll" || echo "  oxcaml_safe_unroll FAILED"
+MG_UNROLL=0 OCAMLFLAGS="-O3 -unsafe" OUT="$OUT/oxcaml_unsafe_plain"   bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_plain" || echo "  oxcaml_unsafe_plain FAILED"
+MG_UNROLL=1 OCAMLFLAGS="-O3 -unsafe" OUT="$OUT/oxcaml_unsafe_unroll"  bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_unroll (shipped)" || echo "  oxcaml_unsafe_unroll FAILED"
+
+# ---- OxCaml : without GC safepoint polls -------------------------------------
+# -disable-poll-insertion drops the back-edge poll that makes a long non-allocating
+# loop preemptible. NOT shippable - without it, signals are delayed indefinitely and a
+# multicore stop-the-world minor GC would hang - but it prices what the poll costs.
+# The answer is not the two instructions it executes (tools/bench_polls.sh NOPs those
+# out of the linked binary and gains nothing); it is that a value cannot live in %r11
+# across a poll, which in the register-starved unrolled kernel forces a spill.
+# Both kernels are built because only the unrolled one is short of registers.
+# Stock ocamlopt has no equivalent flag, so there is no ocaml_* counterpart.
+MG_UNROLL=0 OCAMLFLAGS="-O3 -unsafe -disable-poll-insertion" \
+  OUT="$OUT/oxcaml_unsafe_plain_pollfree"  bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_plain_pollfree" || echo "  oxcaml_unsafe_plain_pollfree FAILED"
+MG_UNROLL=1 OCAMLFLAGS="-O3 -unsafe -disable-poll-insertion" \
+  OUT="$OUT/oxcaml_unsafe_unroll_pollfree" bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_unroll_pollfree" || echo "  oxcaml_unsafe_unroll_pollfree FAILED"
+
+# ---- OCaml (stock upstream compiler) : the same 2x2 -------------------------
+# Same source, closure middle-end instead of flambda2, and no -O3 to pass because the
+# flag is flambda-only. Lining the two ladders up side by side shows which of the
+# OxCaml numbers come from the language and which come from the compiler.
+MG_UNROLL=0 OCAMLFLAGS=""        OUT="$OUT/ocaml_safe_plain"      bash impl/ocaml/build.sh >/dev/null 2>&1 \
+  && echo "  ocaml_safe_plain" || echo "  ocaml_safe_plain FAILED"
+MG_UNROLL=1 OCAMLFLAGS=""        OUT="$OUT/ocaml_safe_unroll"     bash impl/ocaml/build.sh >/dev/null 2>&1 \
+  && echo "  ocaml_safe_unroll" || echo "  ocaml_safe_unroll FAILED"
+MG_UNROLL=0 OCAMLFLAGS="-unsafe" OUT="$OUT/ocaml_unsafe_plain"    bash impl/ocaml/build.sh >/dev/null 2>&1 \
+  && echo "  ocaml_unsafe_plain" || echo "  ocaml_unsafe_plain FAILED"
+MG_UNROLL=1 OCAMLFLAGS="-unsafe" OUT="$OUT/ocaml_unsafe_unroll"   bash impl/ocaml/build.sh >/dev/null 2>&1 \
+  && echo "  ocaml_unsafe_unroll  (shipped)" || echo "  ocaml_unsafe_unroll FAILED"
+
+# ---- Both OCaml compilers : the hand strength reduction ---------------------
+# Carries the four row offsets as running indices instead of rebuilding base + i per row
+# per iteration, because flambda2 does not do that strength reduction itself. Identical
+# arithmetic in identical order, so the output hash is unchanged. Built for BOTH compilers
+# because it helps one and hurts the other, and that contrast is the result.
+MG_SR=1 OCAMLFLAGS="-O3 -unsafe" OUT="$OUT/oxcaml_unsafe_sr" bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_sr" || echo "  oxcaml_unsafe_sr FAILED"
+MG_SR=1 OCAMLFLAGS="-unsafe"    OUT="$OUT/ocaml_unsafe_sr"  bash impl/ocaml/build.sh  >/dev/null 2>&1 \
+  && echo "  ocaml_unsafe_sr" || echo "  ocaml_unsafe_sr FAILED"
+# and strength reduction stacked with poll removal, which are independent causes
+MG_SR=1 OCAMLFLAGS="-O3 -unsafe -disable-poll-insertion" \
+  OUT="$OUT/oxcaml_unsafe_sr_pollfree" bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+  && echo "  oxcaml_unsafe_sr_pollfree" || echo "  oxcaml_unsafe_sr_pollfree FAILED"
+
+# ---- OxCaml 5.4.0+ox : optimizations done IN THE COMPILER, not the source ---
+# Everything above varies the source and holds the compiler fixed at the pinned 5.2.0+ox
+# switch. These three hold the SOURCE fixed (the shipped kernel) and vary the COMPILER,
+# to price two passes added locally: strength reduction of `base + i`, and forming
+# interior pointers in loops that cannot reach the GC. Built only if those compilers are
+# present, so the matrix still runs on a machine that has not built them.
+#
+# MG_OCAMLOPT is essential here: impl/oxcaml/build.sh otherwise selects 5.2.0+ox
+# silently, and all three would be the same binary.
+# Paths are overridable so the compilers can live anywhere; see compiler-patches/README.md
+# for how to build them. Absent, these four rows are skipped and the rest of the matrix
+# runs normally.
+OX54_BASE="${MG_OX54_BASE:-$HOME/oxinstall-baseline/bin/ocamlopt.opt}"  # pristine 5.4.0+ox
+OX54_SR="${MG_OX54_SR:-$HOME/oxinstall-sr/bin/ocamlopt.opt}"            # + strength reduction
+OX54_IP="${MG_OX54_IP:-$HOME/oxinstall-ip/bin/ocamlopt.opt}"           # + interior pointers
+OX54_IVS="${MG_OX54_IVS:-$HOME/oxinstall-ivs/bin/ocamlopt.opt}"         # + invariant-strided IVs
+OX54_LICM="${MG_OX54_LICM:-$HOME/oxinstall-licm/bin/ocamlopt.opt}"       # + loop-invariant code motion
+# A compiler configured --enable-poll-insertion, as every installed OxCaml is. The
+# ladder above was measured on compilers built --enable-flambda2 and nothing else,
+# which leaves POLL_INSERTION=false: no safepoints anywhere, so interior and carried
+# pointers are always legal. Nobody ships that, and it roughly doubles the measured
+# value of the passes, so the same ladder is repeated here against a normally
+# configured compiler - one binary, flags selecting the rungs.
+OX54_POLL="${MG_OX54_POLL:-$HOME/oxinstall-poll/bin/ocamlopt.opt}"
+
+build_ox54 () {  # $1 = variant name, $2 = compiler, $3 = extra flags
+  [ -x "$2" ] || { echo "  $1 SKIPPED (no compiler at $2)"; return; }
+  MG_OCAMLOPT="$2" MG_UNROLL=1 OCAMLFLAGS="-O3 -unsafe $3" OUT="$OUT/$1" \
+    bash impl/oxcaml/build.sh >/dev/null 2>&1 \
+    && echo "  $1" || echo "  $1 FAILED"
+}
+# Same as build_ox54 but selects the SSE2 kernel, which pairs two rows into one
+# vector. Bit-identical by construction: each lane reproduces one row's sum in the
+# order the scalar kernel uses.
+build_simd () {  # $1 = variant name, $2 = compiler, $3 = extra flags
+  [ -x "$2" ] || { echo "  $1 SKIPPED (no compiler at $2)"; return; }
+  MG_OCAMLOPT="$2" MG_UNROLL=1 MG_SIMD=1 OCAMLFLAGS="-O3 -unsafe $3" OUT="$OUT/$1"     bash impl/oxcaml/build.sh >/dev/null 2>&1     && echo "  $1" || echo "  $1 FAILED"
+}
+
+build_ox54 ox54_base     "$OX54_BASE" ""
+build_ox54 ox54_sr       "$OX54_SR"   ""
+build_ox54 ox54_ip_off   "$OX54_IP"   "-no-cmm-interior-pointers"
+build_ox54 ox54_ip       "$OX54_IP"   ""
+build_ox54 ox54_ivs_noptr "$OX54_IVS" "-no-cmm-carried-pointers"
+build_ox54 ox54_ivs      "$OX54_IVS"  ""
+build_ox54 ox54_licm     "$OX54_LICM" ""
+
+# ---- unified run: PR compiler (poll insertion on), flags select the configuration ----
+FIX="$HOME/oxinstall-fix/bin/ocamlopt.opt"
+OFF="-no-cmm-strength-reduction -no-cmm-interior-pointers -no-cmm-invariant-strides -no-cmm-licm"
+build_ox54 pr_off            "$FIX" "$OFF"
+build_ox54 pr_all            "$FIX" ""
+build_ox54 pr_off_nopoll     "$FIX" "$OFF -disable-poll-insertion"
+build_ox54 pr_nopoll         "$FIX" "-disable-poll-insertion"
+build_ox54 pr_counted        "$FIX" "-cmm-counted-loops"
+build_ox54 pr_counted_noptr  "$FIX" "-cmm-counted-loops -no-cmm-interior-pointers -no-cmm-carried-pointers"
+build_ox54 pr_unchecked      "$FIX" "-cmm-unchecked-loops"
+build_simd pr_simd_off       "$FIX" "$OFF"
+build_simd pr_simd           "$FIX" ""
+build_simd pr_simd_counted   "$FIX" "-cmm-counted-loops"
+build_simd pr_simd_nopoll    "$FIX" "-disable-poll-insertion"
+# bounds-checked build with counted loops (no -unsafe)
+[ -x "$FIX" ] && MG_OCAMLOPT="$FIX" MG_UNROLL=1 OCAMLFLAGS="-O3 -cmm-counted-loops" OUT="$OUT/pr_safe_counted" \
+  bash impl/oxcaml/build.sh >/dev/null 2>&1 && echo "  pr_safe_counted" || echo "  pr_safe_counted FAILED"
+# A/A control: a byte-identical copy of pr_counted at another path
+cp "$OUT/pr_counted" "$OUT/pr_counted_copy" && echo "  pr_counted_copy (A/A control)"
+# C++ baseline with VEX encoding (AVX, no FMA contraction, vectoriser off)
+g++ -O3 $CXXFLAGS_COMMON -fno-tree-vectorize -mavx -o "$OUT/cpp_novec_avx" impl/cpp/infer.cpp 2>/dev/null \
+  && echo "  cpp_novec_avx" || echo "  cpp_novec_avx FAILED"
+# polls overwritten by NOPs in the linked shipped binaries (same layout, same registers)
+for bb in oxcaml_unsafe_plain oxcaml_unsafe_unroll; do
+  python3 tools/nop_polls.py "$OUT/$bb" "$OUT/${bb}_pollnop" >/dev/null 2>&1 && echo "  ${bb}_pollnop" || echo "  ${bb}_pollnop FAILED"
+done
+
+# SIMD against the pinned 5.2.0+ox switch as well
+MG_UNROLL=1 MG_SIMD=1 OCAMLFLAGS="-O3 -unsafe" OUT="$OUT/oxcaml_unsafe_simd" bash impl/oxcaml/build.sh >/dev/null 2>&1 && echo "  oxcaml_unsafe_simd" || echo "  oxcaml_unsafe_simd FAILED"
+echo
+
+# name|command   (order sets the report order)
+VARIANTS=()
+for v in cpp_O2_plain cpp_plain cpp_unroll cpp_novec cpp_novec_avx rust_plain rust_unroll          oxcaml_safe_plain oxcaml_safe_unroll oxcaml_unsafe_plain oxcaml_unsafe_unroll          oxcaml_unsafe_plain_pollnop oxcaml_unsafe_unroll_pollnop          oxcaml_unsafe_plain_pollfree oxcaml_unsafe_unroll_pollfree          oxcaml_unsafe_sr oxcaml_unsafe_sr_pollfree oxcaml_unsafe_simd          ocaml_safe_plain ocaml_safe_unroll ocaml_unsafe_plain ocaml_unsafe_unroll ocaml_unsafe_sr          ox54_base ox54_sr ox54_ip_off ox54_ip ox54_ivs_noptr ox54_ivs ox54_licm          pr_off pr_all pr_off_nopoll pr_nopoll pr_counted pr_counted_copy pr_counted_noptr pr_unchecked          pr_safe_counted pr_simd_off pr_simd pr_simd_counted pr_simd_nopoll; do
+  [ -x "$OUT/$v" ] && VARIANTS+=("$v|$OUT/$v")
+done
+VARIANTS+=("python|python3 $ROOT/impl/python/infer.py")
+
+COMMON=(--weights "$ROOT/weights/microgpt.bin" --data "$ROOT/data/val.txt"
+        --samples "$SAMPLES" --seed 1234 --temperature 0.5 --pin -1)
+
+echo "=== correctness: every variant must produce identical output ==="
+: > "$OUT/hashes.txt"
+for e in "${VARIANTS[@]}"; do
+  n="${e%%|*}"; c="${e#*|}"
+  # shellcheck disable=SC2086
+  $c "${COMMON[@]}" --mode all --repeats 1 --time-budget 0.05 2>/dev/null > "$OUT/$n.json"
+  python3 - "$n" "$OUT/$n.json" "$OUT/hashes.txt" <<'PY'
+import json, sys
+name, path, hp = sys.argv[1:4]
+try:
+    r = json.load(open(path))
+except Exception as e:
+    print(f"  {name:22s} FAILED to produce JSON ({e})"); raise SystemExit
+g, p = r["gen"], r["ppl"]
+open(hp, "a").write(f"{name} {g['output_fnv1a64']} {p['perplexity']!r}\n")
+PY
+done
+python3 - "$OUT/hashes.txt" <<'PY'
+import sys
+rows = [l.split() for l in open(sys.argv[1])]
+hs, ps = {r[1] for r in rows}, {r[2] for r in rows}
+for r in rows:
+    print(f"  {r[0]:22s} {r[1]}  ppl={r[2]}")
+print("\n  " + ("ALL IDENTICAL - differences below are real work saved"
+                if len(hs) == 1 and len(ps) == 1 else
+                "*** VARIANTS DISAGREE - do not rank these ***"))
+PY
+echo
+
+for MODE in $MODES; do
+  echo "=== $MODE: $ROUNDS interleaved rounds, $PINNING, budget ${BUDGET}s ==="
+  : > "$OUT/t_$MODE.txt"
+  for ((r=0; r<ROUNDS; r++)); do
+    for e in "${VARIANTS[@]}"; do
+      n="${e%%|*}"; c="${e#*|}"
+      # shellcheck disable=SC2086
+      tps=$("${TASKSET[@]}" $c "${COMMON[@]}" --mode "$MODE" --repeats "$REPEATS" \
+              --time-budget "$BUDGET" 2>/dev/null \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['$MODE']['tokens_per_sec_best'])")
+      echo "$n $tps" >> "$OUT/t_$MODE.txt"
+    done
+  done
+
+  python3 - "$OUT/t_$MODE.txt" <<'PY'
+import statistics, sys
+from collections import defaultdict, OrderedDict
+res = OrderedDict()
+for line in open(sys.argv[1]):
+    k, v = line.split()
+    res.setdefault(k, []).append(float(v))
+
+med = {k: statistics.median(v) for k, v in res.items()}
+slowest = min(med.values())
+fastest = max(med.values())
+
+print("| variant | tok/s (median) | best | sd | vs python | vs fastest |")
+print("|---|---:|---:|---:|---:|---:|")
+for k, v in res.items():
+    sd = statistics.stdev(v) if len(v) > 1 else 0.0
+    print(f"| {k} | {med[k]:,.0f} | {max(v):,.0f} | {sd:,.0f} | "
+          f"{med[k]/slowest:.1f}x | {med[k]/fastest*100:.0f}% |")
+
+W = max([len(k) for k in res] + [len("total")])
+
+def paired(prev, cur):
+    """median paired % change and how many rounds it won, or None if either is absent."""
+    if prev not in res or cur not in res:
+        return None
+    pd = [(a - b) / b * 100 for a, b in zip(res[cur], res[prev])]
+    return statistics.median(pd), sum(1 for x in pd if x > 0), len(pd)
+
+# per-language optimization ladders, each step against the one before it
+LADDERS = [
+    ("C++",                    ["cpp_O2_plain", "cpp_plain", "cpp_unroll"]),
+    ("C++, vectorizer off",    ["cpp_novec", "cpp_unroll"]),
+    ("Rust",                   ["rust_plain", "rust_unroll"]),
+    ("OxCaml (flambda2)",      ["oxcaml_safe_plain", "oxcaml_unsafe_plain",
+                                "oxcaml_unsafe_unroll"]),
+    ("OCaml (stock, closure)", ["ocaml_safe_plain", "ocaml_unsafe_plain",
+                                "ocaml_unsafe_unroll"]),
+]
+print("\neach optimization against the step before it (paired, same rounds):")
+for lang, chain in LADDERS:
+    chain = [c for c in chain if c in res]
+    if len(chain) < 2:
+        continue
+    print(f"\n  {lang}")
+    for prev, cur in zip(chain, chain[1:]):
+        m, w, n = paired(prev, cur)
+        print(f"    {prev:{W}s} -> {cur:{W}s} {m:+7.1f}%   faster in {w}/{n} rounds")
+    tot = (med[chain[-1]] / med[chain[0]] - 1) * 100
+    print(f"    {'total':{W}s}    {chain[0]} -> {chain[-1]}: {tot:+.1f}%")
+
+# A ladder can only show one path through a 2x2, so the two OCaml grids get read off
+# directly as well. The bounds-check rows are the ones that need both unroll levels:
+# the unrolled kernel issues four indexed loads per iteration where the plain one
+# issues one, so it has four times the checks to pay for and the cost of -unsafe is
+# not the same number in the two columns.
+EFFECTS = [
+    ("cost of keeping bounds checks (no -unsafe)", [
+        ("OxCaml, plain kernel",    "oxcaml_unsafe_plain",   "oxcaml_safe_plain"),
+        ("OxCaml, unrolled kernel", "oxcaml_unsafe_unroll",  "oxcaml_safe_unroll"),
+        ("OCaml,  plain kernel",    "ocaml_unsafe_plain",    "ocaml_safe_plain"),
+        ("OCaml,  unrolled kernel", "ocaml_unsafe_unroll",   "ocaml_safe_unroll"),
+    ]),
+    ("value of the 4-way unroll, at each safety level", [
+        ("OxCaml, -unsafe",         "oxcaml_unsafe_plain",   "oxcaml_unsafe_unroll"),
+        ("OxCaml, bounds-checked",  "oxcaml_safe_plain",     "oxcaml_safe_unroll"),
+        ("OCaml,  -unsafe",         "ocaml_unsafe_plain",    "ocaml_unsafe_unroll"),
+        ("OCaml,  bounds-checked",  "ocaml_safe_plain",      "ocaml_safe_unroll"),
+    ]),
+    ("cost of the GC safepoint poll (OxCaml only - stock ocamlopt has no such flag)", [
+        ("OxCaml, plain kernel",    "oxcaml_unsafe_plain",   "oxcaml_unsafe_plain_pollfree"),
+        ("OxCaml, unrolled kernel", "oxcaml_unsafe_unroll",  "oxcaml_unsafe_unroll_pollfree"),
+    ]),
+    ("compiler passes added locally (source fixed, compiler varies; 5.4.0+ox)", [
+        ("strength reduction, in the compiler", "ox54_base",   "ox54_sr"),
+        ("interior pointers (flag off -> on)",  "ox54_ip_off", "ox54_ip"),
+        ("interior pointers over plain SR",     "ox54_sr",     "ox54_ip"),
+        ("both, vs pristine 5.4.0+ox",          "ox54_base",   "ox54_ip"),
+        ("invariant strides over interior ptrs", "ox54_ip",    "ox54_ivs"),
+        ("carried pointers vs integers only",   "ox54_ivs_noptr", "ox54_ivs"),
+        ("all three, vs pristine 5.4.0+ox",     "ox54_base",   "ox54_ivs"),
+        ("LICM on top (expected: inert)",       "ox54_ivs",    "ox54_licm"),
+        ("best OxCaml vs like-for-like C++",    "ox54_licm",   "cpp_novec"),
+        ("best OxCaml vs C++ as shipped",       "ox54_licm",   "cpp_unroll"),
+    ]),
+    ("hand strength reduction of base + i (flambda2 will not do it)", [
+        ("OxCaml",                  "oxcaml_unsafe_unroll",  "oxcaml_unsafe_sr"),
+        ("OCaml (stock)",           "ocaml_unsafe_unroll",   "ocaml_unsafe_sr"),
+        ("OxCaml, on top of it, polls removed too",
+                                    "oxcaml_unsafe_sr",      "oxcaml_unsafe_sr_pollfree"),
+        ("OxCaml, both together vs shipped",
+                                    "oxcaml_unsafe_unroll",  "oxcaml_unsafe_sr_pollfree"),
+    ]),
+    ("flambda2 over the stock closure middle-end, same source", [
+        ("plain, bounds-checked",   "ocaml_safe_plain",      "oxcaml_safe_plain"),
+        ("unrolled, bounds-checked","ocaml_safe_unroll",     "oxcaml_safe_unroll"),
+        ("plain, -unsafe",          "ocaml_unsafe_plain",    "oxcaml_unsafe_plain"),
+        ("shipped vs shipped",      "ocaml_unsafe_unroll",   "oxcaml_unsafe_unroll"),
+    ]),
+]
+LW = max(len(lbl) for _, rows in EFFECTS for lbl, _, _ in rows)
+for title, rows in EFFECTS:
+    shown = [(lbl, paired(b, t)) for lbl, b, t in rows]
+    shown = [(lbl, r) for lbl, r in shown if r]
+    if not shown:
+        continue
+    print(f"\n  {title}:")
+    for lbl, (m, w, n) in shown:
+        print(f"    {lbl:{LW}s} {m:+7.1f}%   faster in {w}/{n} rounds")
+PY
+  echo
+done

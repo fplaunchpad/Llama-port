@@ -7,8 +7,10 @@ lose to C++ - and to each other.
     wsl -d Debian -- python3 tools/profile_regions.py --mode ppl
     wsl -d Debian -- python3 tools/profile_regions.py --impls cpp
     wsl -d Debian -- python3 tools/profile_regions.py --impls ocaml,oxcaml
+    python3 tools/profile_regions.py --rounds 7 --impls cpp,cpp_novec,oxcaml,ox54_ivs,ox54_ip,pr_counted
+                                     # the report's Figure 6 (report/data/profile_regions.log)
 
-Must run inside one Linux environment, for the same reason tools/bench_wsl.sh does:
+Must run inside one Linux environment, for the same reason bench/bench.py does:
 comparing a WSL binary against a Windows-native one measures the OS and libm.
 
 WHY NOT perf
@@ -60,10 +62,29 @@ OPAM_SWITCH = "5.2.0+ox"
 # (impl name, opam switch or "" for whatever ocamlopt is on PATH, ocamlopt flags).
 # These must match what each port's build.sh ships, or the profile describes a binary
 # nobody benchmarks: -O3 is flambda-only, so the stock build does not pass it.
+# (profile name, opam switch / "" for PATH / absolute ocamlopt path, flags, impl dir)
 ML_TOOLCHAINS = [
-    ("oxcaml", OPAM_SWITCH, "-O3 -unsafe"),
-    ("ocaml", "", "-unsafe"),
+    ("oxcaml", OPAM_SWITCH, "-O3 -unsafe", "oxcaml"),
+    ("ocaml", "", "-unsafe", "ocaml"),
 ]
+
+# Locally built compilers, profiled only if present. These share impl/oxcaml's source -
+# the whole point is to hold the source fixed and vary the compiler. Override the paths
+# with MG_OX54_IVS / MG_OX54_IP / MG_OX54_SR.
+for _name, _env, _default in [
+    ("ox54_ivs", "MG_OX54_IVS", os.path.expanduser("~/oxinstall-ivs/bin/ocamlopt.opt")),
+    ("ox54_ip", "MG_OX54_IP", os.path.expanduser("~/oxinstall-ip/bin/ocamlopt.opt")),
+    ("ox54_sr", "MG_OX54_SR", os.path.expanduser("~/oxinstall-sr/bin/ocamlopt.opt")),
+]:
+    _p = os.environ.get(_env, _default)
+    if os.path.isfile(_p) and os.access(_p, os.X_OK):
+        ML_TOOLCHAINS.append((_name, _p, "-O3 -unsafe", "oxcaml"))
+
+# The pull-request compiler with counted loops (variant pr_counted; Figure 6(c) of the
+# report). Override the path with MG_OX_PR.
+_p = os.environ.get("MG_OX_PR", os.path.expanduser("~/oxinstall-fix/bin/ocamlopt.opt"))
+if os.path.isfile(_p) and os.access(_p, os.X_OK):
+    ML_TOOLCHAINS.append(("pr_counted", _p, "-O3 -unsafe -cmm-counted-loops", "oxcaml"))
 
 # What each region covers, for the report legend.
 LEGEND = {
@@ -399,23 +420,32 @@ def sh(cmd, **kw):
                           text=True, cwd=ROOT, **kw)
 
 
-def build_cpp(src_path, out_path):
-    r = sh(["g++"] + CXXFLAGS + ["-o", out_path, src_path])
+def build_cpp(src_path, out_path, extra=()):
+    r = sh(["g++"] + CXXFLAGS + list(extra) + ["-o", out_path, src_path])
     return (True, "") if r.returncode == 0 else (False, r.stderr[-3000:])
 
 
 def build_ml(src_path, stub_path, out_path, switch=OPAM_SWITCH, flags="-O3 -unsafe"):
-    """Build an instrumented OCaml binary. `switch` empty means "whatever is on PATH",
-    which is how the stock-compiler port is built - see ML_TOOLCHAINS."""
+    """Build an instrumented OCaml binary.
+
+    `switch` is one of: an opam switch name; "" meaning whatever ocamlopt is on PATH
+    (how the stock-compiler port is built); or an absolute path to an ocamlopt binary,
+    for profiling a locally built compiler. See ML_TOOLCHAINS."""
     work = os.path.dirname(src_path)
-    setup = (f'eval "$(opam env --switch={switch} 2>/dev/null)" || true\nhash -r'
-             if switch else "")
+    if switch.startswith("/"):
+        setup, cc = "", f'"{switch}"'
+    else:
+        setup = (f'eval "$(opam env --switch={switch} 2>/dev/null)" || true\nhash -r'
+                 if switch else "")
+        cc = "ocamlopt"
+    # The C stub needs the runtime headers of whichever compiler is building the OCaml,
+    # so ask that compiler where they are rather than assuming the one on PATH.
     script = f'''
 set -e
 {setup}
 cd "{work}"
-gcc -O2 -c -I"$(ocamlopt -where)" "{stub_path}" -o prof_stub.o
-ocamlopt {flags} -I +unix unix.cmxa prof_stub.o "{src_path}" -o "{out_path}"
+gcc -O2 -c -I"$({cc} -where)" "{stub_path}" -o prof_stub.o
+{cc} {flags} -I +unix unix.cmxa prof_stub.o "{src_path}" -o "{out_path}"
 '''
     r = sh(["bash", "-lc", script])
     return (True, "") if r.returncode == 0 else (False, (r.stdout + r.stderr)[-3000:])
@@ -514,30 +544,38 @@ def main():
 
     built = {}
 
-    if "cpp" in want:
+    # `cpp` is the shipped build, which GCC vectorizes. `cpp_novec` disables that, and is
+    # the like-for-like baseline for the OCaml ports: no OCaml backend emits a packed
+    # instruction, so comparing them against vectorized C++ measures an instruction set
+    # the other side cannot reach. Profile against cpp_novec when the question is codegen
+    # quality, against cpp when the question is "how far from the shipped C++ port".
+    for cname, extra in [("cpp", ()), ("cpp_novec", ("-fno-tree-vectorize",))]:
+        if cname not in want:
+            continue
         src = open(os.path.join(ROOT, "impl", "cpp", "infer.cpp")).read()
-        gen = os.path.join(work, "infer_prof.cpp")
+        gen = os.path.join(work, f"infer_prof_{cname}.cpp")
         open(gen, "w").write(instrument(src, CPP_PRELUDE,
                                         "// --------------------------------------------------------------- kernels",
-                                        CPP_EDITS, "cpp"))
-        ok, err = build_cpp(gen, os.path.join(work, "cpp_prof"))
-        print(f"build cpp    instrumented {'ok' if ok else 'FAILED: ' + err}")
+                                        CPP_EDITS, cname)
+                             .replace("#PROF impl=cpp", f"#PROF impl={cname}"))
+        ok, err = build_cpp(gen, os.path.join(work, f"{cname}_prof"), extra)
+        print(f"build {cname:9s} instrumented {'ok' if ok else 'FAILED: ' + err}")
         if ok:
-            built["cpp"] = [os.path.join(work, "cpp_prof")]
+            built[cname] = [os.path.join(work, f"{cname}_prof")]
         ok2, err2 = build_cpp(os.path.join(ROOT, "impl", "cpp", "infer.cpp"),
-                              os.path.join(work, "cpp_ship"))
-        print(f"build cpp    shipped      {'ok' if ok2 else 'FAILED: ' + err2}")
+                              os.path.join(work, f"{cname}_ship"), extra)
+        print(f"build {cname:9s} shipped      {'ok' if ok2 else 'FAILED: ' + err2}")
 
     # Both OCaml ports instrument from the SAME anchors, because impl/ocaml/main.ml and
     # impl/oxcaml/main.ml are held byte-identical outside their headers. Profiling them
     # side by side is the only way to see which regions flambda2 actually wins, rather
     # than inferring it from one aggregate tok/s number.
-    for name, switch, flags in ML_TOOLCHAINS:
+    for name, switch, flags, srcdir in ML_TOOLCHAINS:
         if name not in want:
             continue
         subdir = os.path.join(work, name)
         os.makedirs(subdir, exist_ok=True)
-        src = open(os.path.join(ROOT, "impl", name, "main.ml")).read()
+        src = open(os.path.join(ROOT, "impl", srcdir, "main.ml")).read()
         gen = os.path.join(subdir, "main.ml")
         text = instrument(src, ML_PRELUDE,
                           "(* ----------------------------------------------------------------- kernels",
@@ -549,8 +587,11 @@ def main():
         print(f"build {name:6s} instrumented {'ok' if ok else 'FAILED: ' + err}")
         if ok:
             built[name] = [os.path.join(subdir, "prof")]
+        # The uninstrumented build must use the SAME compiler, or the magnitudes this
+        # profile is anchored to come from a different binary than the shares.
+        env = f'MG_OCAMLOPT="{switch}" ' if switch.startswith("/") else ""
         r = sh(["bash", "-lc",
-                f'OUT="{subdir}/ship" bash "{ROOT}/impl/{name}/build.sh"'])
+                f'{env}OCAMLFLAGS="{flags}" OUT="{subdir}/ship" bash "{ROOT}/impl/{srcdir}/build.sh"'])
         print(f"build {name:6s} shipped      "
               f"{'ok' if r.returncode == 0 else 'FAILED: ' + r.stderr[-800:]}")
     print()
@@ -567,7 +608,7 @@ def main():
     # UNinstrumented binary's measured time per token.
     per_impl = {}
     for name, cmd in built.items():
-        ship = (os.path.join(work, "cpp_ship") if name == "cpp"
+        ship = (os.path.join(work, f"{name}_ship") if name.startswith("cpp")
                 else os.path.join(work, name, "ship"))
         prof_runs, ship_tps = [], []
         for _ in range(args.rounds):
@@ -667,17 +708,24 @@ def main():
                     ["<", ">", ">", ">", ">", ">", ">", ">"]))
         print(f"\n  {note}")
 
-    if "cpp" in per_impl and "oxcaml" in per_impl:
-        gap_report("cpp", "oxcaml",
-                   "Read 'of gap' first: the share of OxCaml's total slowdown this region\n"
-                   "  is responsible for. A region can be 3x slower and not matter (embed), or\n"
-                   "  1.6x slower and dominate (mlp). 'ns/op' is the per-float-operation cost,\n"
-                   "  which is the codegen-quality signal with problem size divided out.")
-    if "cpp" in per_impl and "ocaml" in per_impl:
-        gap_report("cpp", "ocaml",
-                   "The same split for the stock compiler. Compare it against the OxCaml\n"
-                   "  table above region by region: identical source, so every difference\n"
-                   "  between the two 'of gap' columns is the middle-end choosing differently.")
+    # Every C++ baseline against every OCaml build that was profiled. cpp_novec is the
+    # like-for-like one: no OCaml backend emits packed instructions, so a gap measured
+    # against vectorized C++ includes an instruction set OCaml cannot reach, and
+    # attributing that to codegen would be wrong.
+    cpps = [n for n in ("cpp_novec", "cpp") if n in per_impl]
+    mls = [n for n in per_impl if not n.startswith("cpp")]
+    for c in cpps:
+        for m in mls:
+            if c == "cpp_novec":
+                note = (f"LIKE-FOR-LIKE: {c} emits no packed instructions, and neither does\n"
+                        f"  {m}, so this table is codegen quality with the instruction set held\n"
+                        "  equal. 'of gap' is the share of the total slowdown each region owns;\n"
+                        "  'ns/op' is per-float-operation cost with problem size divided out.")
+            else:
+                note = (f"{c} is the SHIPPED C++ build, which GCC vectorizes while no OCaml\n"
+                        "  backend does. Part of this gap is therefore an instruction set rather\n"
+                        "  than codegen - see the cpp_novec table for the like-for-like split.")
+            gap_report(c, m, note)
     if "oxcaml" in per_impl and "ocaml" in per_impl:
         fast, slow = (("oxcaml", "ocaml")
                       if per_impl["ocaml"]["ns_per_tok"] >= per_impl["oxcaml"]["ns_per_tok"]
@@ -688,7 +736,7 @@ def main():
                    "  one compiler codegens better. On the shipped 4-way-unrolled kernel the\n"
                    "  two are close; the gap opens up on the plain kernel, where flambda2 is\n"
                    "  recovering by itself the instruction-level parallelism the unroll\n"
-                   "  supplies by hand. See OPTIMIZATIONS.md.")
+                   "  supplies by hand. See README.md.")
 
     if args.keep:
         print(f"\ngenerated sources kept in {work}")

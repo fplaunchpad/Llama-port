@@ -1,0 +1,163 @@
+% UGRC 2 report -- Aadi Srivastava (CS23B100), guide: KC Sivaramakrishnan.
+% Build:  pdflatex main && bibtex main && pdflatex main && pdflatex main
+%         (or: latexmk -pdf main.tex, or upload the report/ folder to Overleaf)
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=2.5cm,headheight=14pt]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage[table]{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+
+\graphicspath{{figures/}}
+
+% ---------------------------------------------------------------- colours
+\definecolor{ugblue}{RGB}{31,63,127}
+\definecolor{uggrey}{RGB}{128,128,128}
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codecomment}{RGB}{90,120,90}
+\definecolor{codekw}{RGB}{31,63,127}
+\definecolor{rowhi}{RGB}{232,239,250}
+\hypersetup{colorlinks=true,linkcolor=ugblue,citecolor=ugblue,urlcolor=ugblue}
+
+% ---------------------------------------------------------------- headings
+\titleformat{\section}{\normalfont\Large\bfseries\color{ugblue}}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalfont\large\bfseries\color{ugblue}}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalfont\normalsize\bfseries\color{ugblue}}{\thesubsubsection}{1em}{}
+
+% ---------------------------------------------------------------- running header
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\sectionmark}[1]{\markboth{\thesection\quad #1}{}}
+\fancyhead[L]{\small\MakeUppercase{\leftmark}}
+\fancyhead[R]{\small UGRC 2 Report}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ---------------------------------------------------------------- listings
+\lstdefinelanguage{OCamlX}{
+  morekeywords={let,in,for,to,downto,do,done,if,then,else,match,with,fun,
+    function,mutable,type,module,open,external,rec,and,begin,end,while,of},
+  sensitive=true,
+  morecomment=[n]{(*}{*)},
+  morestring=[b]"
+}
+\lstdefinelanguage{CmmX}{
+  morekeywords={let,letmut,catch,exit,with,if,load,store,alloc,poll,assign},
+  sensitive=true,
+  morecomment=[l]{;}
+}
+\lstdefinelanguage{asmX}{
+  morekeywords={mov,movsd,vmovsd,vmulsd,vaddsd,vfmadd231sd,vfmadd231pd,
+    vmovupd,addsd,mulsd,add,sub,cmp,jl,jle,jg,jge,jne,je,jmp,lea,sar,shl,inc,
+    dec,test,call,ret,cmpq,addq,movq,leaq,subq,sarq,jb,jae,ja,jbe,nop,
+    vxorpd,vaddpd,vmulpd,vfmadd213sd,imul},
+  sensitive=false,
+  morecomment=[l]{\#}
+}
+\lstdefinelanguage{plaintext}{}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecomment}\itshape,
+  stringstyle=\color{teal},
+  numbers=left,
+  numberstyle=\tiny\color{uggrey},
+  numbersep=6pt,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{black!15},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=2,
+  captionpos=b,
+  xleftmargin=1.5em,
+  framexleftmargin=1.5em,
+  aboveskip=0.8em,
+  belowskip=0.6em
+}
+\renewcommand{\lstlistingname}{Listing}
+
+% ---------------------------------------------------------------- misc
+\setlist{itemsep=2pt,topsep=4pt}
+\captionsetup{font=small,labelfont=bf}
+% \code{...} prints its argument verbatim in typewriter (underscores allowed).
+% Do not use it in captions or section titles; write \texttt{a\_b} there.
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+% \ainl|...| prints inline assembly verbatim, including % and $ characters.
+\newcommand*{\ainl}{\lstinline[basicstyle=\ttfamily\small,language=plaintext]}
+% \reg{r11} prints the register name %r11.
+\newcommand{\reg}[1]{\texttt{\%#1}}
+\newcommand{\x}{\ensuremath{\times}}
+\setlength{\parskip}{0.35em}
+\renewcommand{\arraystretch}{1.12}
+
+\begin{document}
+
+% ================================================================ title page
+\begin{titlepage}
+  \centering
+  \vspace*{4cm}
+  {\color{ugblue}\Huge\bfseries Mind the Gap:\\[0.3em]
+   Porting a Transformer Across Languages\\[0.3em]
+   and Teaching OxCaml to Catch Up with C++\par}
+  \vspace{1.6cm}
+  {\large UGRC 2 : Aadi Srivastava CS23B100\par}
+  \vspace{0.4cm}
+  {\large Guide: KC Sivaramakrishnan\par}
+  \vspace{0.6cm}
+  {\color{uggrey}\small Performance Engineering $\cdot$ Optimising Compilers $\cdot$
+    Garbage-Collected Runtimes $\cdot$ OCaml / OxCaml\par}
+  \vspace{2.5cm}
+  \rule{0.45\textwidth}{0.4pt}
+  \vfill
+\end{titlepage}
+
+\tableofcontents
+\clearpage
+
+\input{sections/01_introduction}
+\input{sections/02_background}
+\input{sections/03_porting}
+\input{sections/04_methodology}
+\input{sections/05_source_level}
+\input{sections/06_diagnosis}
+\input{sections/07_polls}
+\input{sections/08_strength_reduction}
+\input{sections/09_interior_pointers}
+\input{sections/10_outer_loop}
+\input{sections/11_reality_check}
+\input{sections/12_counted_loops}
+\input{sections/13_simd}
+\input{sections/14_generality}
+\input{sections/15_results}
+\input{sections/16_challenges}
+\input{sections/17_conclusion}
+
+\clearpage
+\phantomsection
+\addcontentsline{toc}{section}{References}
+\markboth{References}{}
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

@@ -1,8 +1,8 @@
-From 3c8d234c53f24ead0f2034455da46b5fb6fbd326 Mon Sep 17 00:00:00 2001
-From: TRALS <lol@mydebian.com>
+From d5dc19ff990c040dc7de531a6b0a2350a009db68 Mon Sep 17 00:00:00 2001
+From: Aadi Srivastava <aadisrivastava.iitm@gmail.com>
 Date: Tue, 29 Sep 2026 15:46:29 +0000
-Subject: [PATCH] Form interior pointers into array rows in loops that cannot
- reach the GC
+Subject: [PATCH 2/8] Form interior pointers into array rows in loops that
+ cannot reach the GC
 
 The strength reduction in the previous commit turns four address recomputations
 into four running indices.  Four fixed row addresses plus one shared index is
@@ -65,8 +65,6 @@ here keeps the failure mode "the pass declines" rather than the backend's
 `bad GC root`, which names neither a loop nor a source location.
 
 Off with -no-cmm-interior-pointers.
-
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 ---
  backend/cmm_strength_reduction.ml | 437 +++++++++++++++++++++++++++++-
  driver/oxcaml_args.ml             |  17 ++

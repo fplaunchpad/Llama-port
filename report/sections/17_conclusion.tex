@@ -1,0 +1,75 @@
+\section{Conclusions and Future Work}
+\label{sec:conclusion}
+
+\begin{itemize}
+  \item \textbf{Correctness first.} Five ports give the same text and the same
+        perplexity in all 17 printed digits, which took a written numerical
+        contract and an output hash; matching text alone proves little.
+  \item \textbf{Most of the first gap was ordinary:} bounds checks and missing
+        instruction-level parallelism, whose value depended on how well each
+        compiler's plain loop already ran.
+  \item \textbf{The rest was integer bookkeeping, not floating point and not
+        SIMD.} OCaml's ban on interior pointers forces index arithmetic, and
+        Cmm passes remove it without changing the source, with derived
+        pointers confined to loop regions in which no object can move.
+  \item \textbf{Safepoints are the real constraint.} Counted loops move polls
+        to loop exits, keeping the collector safe and every proved loop
+        reaching a poll, at the cost of unbounded pause latency, and
+        let the passes act: $+30.2\%$ (21/21) on unchanged source,
+        leaving OxCaml $1.29\times$ behind scalar C++ with bounds checks
+        off ($1.26\times$ with the SSE2 kernel); with bounds checks
+        kept the pull request is $-14.9\%$ (1/21)
+        against the release.
+  \item \textbf{The passes generalise to loops of a precise shape,} arrays
+        indexed as \code{base + m*counter + c}, as the held-out PolyBench
+        kernels and the port to stock OCaml confirm; they do nothing for
+        compute-bound or call-heavy code such as ChaCha20.
+  \item \textbf{What remains is not instruction count.} The patched inner loop
+        is, by \code{llvm-mca}'s model, limited by the floating-point ports,
+        like C++'s; by an estimate from isolated timings, about half of the
+        remaining gap lies outside it, and longer rows shrink it.
+  \item \textbf{Explicit SIMD and the passes overlap:} with counted loops the
+        SSE2 kernel adds only $+5.2\%$.
+\end{itemize}
+
+The broader point matches my guide's framing: to get performance from OxCaml
+you opt in --- with \code{-unsafe}, explicit SIMD, or a flag such as
+\code{-cmm-counted-loops} --- and the compiler meets you most of the way.
+
+\subsection{Limitations}
+\begin{itemize}
+  \item \textbf{Bounds checks.} With checks kept, the pull request is slower
+        than the release (Section~\ref{sec:unified}).
+  \item \textbf{Latency.} A counted loop delays other domains'
+        stop-the-world requests for its whole running time; the trip cap that
+        bounds this is off by default, limits iterations rather than time,
+        and costs microgpt much of its gain.
+  \item \textbf{One target.} Only x86-64 was tested; arm64 and the LLVM
+        backend are untested.
+  \item \textbf{One small model.} Every microgpt conclusion rests on one
+        34\,KB model, and the width sweep used one layer, random weights and a
+        short context; deeper and attention-heavy models are untested.
+  \item \textbf{Resolution.} Run W resolves about 3\%; counted, unchecked and
+        poll-free builds differ by about that much or less, and on some nx
+        cases code placement alone moves results by up to about 12\%.
+\end{itemize}
+
+\subsection{Future Work}
+\begin{itemize}
+  \item \textbf{Bounded latency:} strip mining, counted strips inside a polled
+        outer loop, as C2 does.
+  \item \textbf{Bounds-checked code:} decline interior pointers where a check
+        keeps the index live, or replace the test with the pointer (linear
+        function test replacement).
+  \item \textbf{Upstreaming:} split the pull request, starting with strength
+        reduction; test on arm64; resolve the \reg{r11} question.
+  \item \textbf{Attribute the last gap} with \code{perf stat}, and measure
+        wider programs with Sandmark.
+  \item \textbf{Derived pointers across safepoints:} frame-table entries that
+        rebuild a derived pointer from its
+        base~\cite{diwan1992compiler,llvm_statepoints}.
+  \item \textbf{Larger workloads:} deeper models, the attention
+        restructuring of Section~\ref{sec:residual}, and calling an OxCaml hot
+        loop from \code{llama.cpp} through the foreign function interface, as
+        my guide suggested.
+\end{itemize}

@@ -1,0 +1,344 @@
+From c68a8d53c526578cb0bf63dea0b70630fc5a3948 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:29 +0000
+Subject: [PATCH 12/24] 04-outbound-parts-are-not-gc-points
+
+---
+ backend/cmm_strength_reduction.ml | 217 ++++++++++++++++++++++--------
+ 1 file changed, 163 insertions(+), 54 deletions(-)
+
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index 1cbfea3c5f..48ed0f04a1 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -548,19 +548,123 @@ let operation_is_safepoint (op : operation) =
+   | Cdomain_index | Cpause ->
+     false
+ 
+-(* Does no collection happen anywhere inside [expr]? A nested loop is covered by
+-   the same walk: a back edge only carries a poll when polling is enabled, and
+-   the caller has already established that it is not. *)
+-let rec is_gc_free expr =
++let rec handler_labels acc expr =
++  let acc =
++    match expr with
++    | Ccatch (_, handlers, _) ->
++      List.map (fun (handler : static_handler) -> handler.label) handlers @ acc
++    | _ -> acc
++  in
++  let acc = ref acc in
++  iter_subexpressions (fun sub -> acc := handler_labels !acc sub) expr;
++  !acc
++
++(* Does an exit to [target] leave the node whose handlers are [inside]? *)
++let leaves ~inside (target : exit_label) =
++  match target with
++  | Return_lbl -> true
++  | Lbl l -> not (List.exists (Static_label.equal l) inside)
++
++(* Does [expr] exit to one of the labels [inside]? *)
++let rec jumps_inside ~inside expr =
+   match expr with
+-  | Cop (op, _, _) when operation_is_safepoint op -> false
++  | Cexit (Lbl l, _, _) when List.exists (Static_label.equal l) inside -> true
+   | _ ->
+-    let safe = ref true in
+-    iter_subexpressions (fun sub -> if !safe then safe := is_gc_free sub) expr;
+-    !safe
++    let found = ref false in
++    iter_subexpressions
++      (fun sub -> if not !found then found := jumps_inside ~inside sub)
++      expr;
++    !found
++
++(* The parts of [body], a handler body of the loop whose handlers (nested ones
++   included) are [inside], that run only on the way out of the loop: an exit to
++   a label outside the loop, and a subexpression in tail position that never
++   exits to a label inside it. Once control reaches one of them the loop is
++   over. With [~tail:false] only the exits count (for the code that enters the
++   loop). The parts are returned as a predicate on physical identity, so the
++   caller must ask about subexpressions of [body] itself. *)
++let outbound_parts ~inside ~tail body =
++  let parts = ref [] in
++  let rec walk ~tail expr =
++    match expr with
++    | Cexit (target, _, _) when leaves ~inside target -> parts := expr :: !parts
++    | _ when tail && not (jumps_inside ~inside expr) -> parts := expr :: !parts
++    | Clet (_, def, body) ->
++      walk ~tail:false def;
++      walk ~tail body
++    | Cphantom_let (_, _, body) | Cname_for_debugger (_, body) ->
++      walk ~tail body
++    | Csequence (e1, e2) ->
++      walk ~tail:false e1;
++      walk ~tail e2
++    | Cifthenelse (cond, _, ifso, _, ifnot, _) ->
++      walk ~tail:false cond;
++      walk ~tail ifso;
++      walk ~tail ifnot
++    | Cswitch (sel, _, cases, _) ->
++      walk ~tail:false sel;
++      Array.iter (fun (case, _) -> walk ~tail case) cases
++    | Ccatch (_, handlers, body) ->
++      walk ~tail body;
++      List.iter
++        (fun (handler : static_handler) -> walk ~tail handler.body)
++        handlers
++    | _ -> iter_subexpressions (walk ~tail:false) expr
++  in
++  walk ~tail body;
++  let parts = !parts in
++  fun expr -> List.exists (fun part -> part == expr) parts
++
++(* The outbound parts of the handlers of the loop [node]. *)
++let outbound_of_handler ~node (handler : static_handler) =
++  outbound_parts ~inside:(handler_labels [] node) ~tail:true handler.body
++
++(* Does no collection happen while the loop [node] runs? A nested loop is
++   covered by the same walk: a back edge only carries a poll when polling is
++   enabled, and the caller has already established that it is not.
++
++   The parts of the loop that run only on the way out of it ([outbound_parts])
++   are not inspected: a safepoint there is a safepoint after the loop, which is
++   where a counted loop polls anyway. That is sound for the pointer passes
++   because they leave those parts alone ([skip_outbound], [without_outbound]),
++   so nothing they derive is used there and nothing read there is read early.
++   This admits the common loop that boxes its float accumulator as it leaves. *)
++let is_gc_free_loop node =
++  let rec gc_free ~out expr =
++    if out expr
++    then true
++    else
++      match expr with
++      | Cop (op, _, _) when operation_is_safepoint op -> false
++      | _ ->
++        let safe = ref true in
++        iter_subexpressions
++          (fun sub -> if !safe then safe := gc_free ~out sub)
++          expr;
++        !safe
++  in
++  match node with
++  | Ccatch (_, handlers, body) ->
++    let inside = handler_labels [] node in
++    gc_free ~out:(outbound_parts ~inside ~tail:false body) body
++    && List.for_all
++         (fun (handler : static_handler) ->
++           gc_free ~out:(outbound_of_handler ~node handler) handler.body)
++         handlers
++  | _ -> gc_free ~out:(fun _ -> false) node
++
++(* [rewrite expr], or [expr] itself if it is an outbound part. *)
++let skip_outbound ~out rewrite expr = if out expr then expr else rewrite expr
++
++(* [expr] with its outbound parts replaced by a constant. For analyses that must
++   not see bindings made there. *)
++let rec without_outbound ~out expr =
++  if out expr
++  then Ctuple []
++  else map_subexpressions (without_outbound ~out) expr
+ 
+ (* Does [expr] contain a loop that will still have a poll on its back edge?
+-   [is_gc_free] does not ask, because without polling a back edge is not a
++   [is_gc_free_loop] does not ask, because without polling a back edge is not a
+    safepoint. With polling on, every loop keeps its poll unless it is a counted
+    loop, and a derived pointer carried by an enclosing loop would be live across
+    that poll, which [Emit] rejects as a bad GC root. *)
+@@ -822,7 +926,7 @@ let same_base (root, invariant, bytes) (root', invariant', bytes') =
+ 
+ (* Rewrite the load and store addresses of [body] against [counter]. Returns the
+    bindings to hoist and the new body. *)
+-let hoist_bases ~affines ~defs ~invariant ~counter ~dbg body =
++let hoist_bases ~out ~affines ~defs ~invariant ~counter ~dbg body =
+   let bases = ref [] in
+   let base_var key =
+     match List.find_opt (fun (key', _) -> same_base key key') !bases with
+@@ -872,12 +976,15 @@ let hoist_bases ~affines ~defs ~invariant ~counter ~dbg body =
+             else Cop (Cadda, [base; Cconst_int (displacement, dbg)], dbg))
+   in
+   let rec loop expr =
+-    match expr with
+-    | Cop ((Cload _ as op), [address], dbg) ->
+-      Cop (op, [rewrite_address dbg (loop address)], dbg)
+-    | Cop ((Cstore _ as op), [address; value], dbg) ->
+-      Cop (op, [rewrite_address dbg (loop address); loop value], dbg)
+-    | _ -> map_subexpressions loop expr
++    skip_outbound ~out
++      (fun expr ->
++        match expr with
++        | Cop ((Cload _ as op), [address], dbg) ->
++          Cop (op, [rewrite_address dbg (loop address)], dbg)
++        | Cop ((Cstore _ as op), [address; value], dbg) ->
++          Cop (op, [rewrite_address dbg (loop address); loop value], dbg)
++        | _ -> map_subexpressions loop expr)
++      expr
+   in
+   let body = loop body in
+   let bindings =
+@@ -905,7 +1012,8 @@ let interior_pointers ~duplicated ~label ~expr =
+   in
+   (* The derived pointers live across the whole node, so the whole node has to
+      be free of safepoints, not just the handler being rewritten. *)
+-  if not (is_gc_free expr) then raise Not_applicable;
++  if not (is_gc_free_loop expr) then raise Not_applicable;
++  let out = outbound_of_handler ~node:expr handler in
+   let bound_inside = bound_variables V.Set.empty expr in
+   let invariant v = not (V.Set.mem v bound_inside) in
+   let defs = defs_of_body ~duplicated handler.body in
+@@ -924,7 +1032,7 @@ let interior_pointers ~duplicated ~label ~expr =
+       then try_counter params
+       else
+         let bindings, rewritten =
+-          hoist_bases ~affines ~defs ~invariant ~counter ~dbg handler.body
++          hoist_bases ~out ~affines ~defs ~invariant ~counter ~dbg handler.body
+         in
+         (* Nothing was hoisted: the rewrite would at best shuffle a constant
+            between two equivalent addressing modes, so leave the loop to the
+@@ -1233,11 +1341,16 @@ let reduce_invariant_strides ~duplicated ~int_vars ~relaxed ~carry_pointers
+       else find_counter (index + 1) params
+   in
+   let index, counter, affines, _classified = find_counter 0 handler.params in
++  (* A binding made on the way out of the loop may follow a safepoint there, so
++     it is not carried. *)
++  let analysed =
++    without_outbound ~out:(outbound_of_handler ~node:expr handler) handler.body
++  in
+   let forms =
+     forms_of_body ~dbg ~duplicated ~counter ~invariant ~int_vars ~relaxed
+-      handler.body
++      analysed
+   in
+-  let defs = defs_of_body ~duplicated handler.body in
++  let defs = defs_of_body ~duplicated analysed in
+   (* A constant stride is [reduce]'s business, and carrying a value derived from
+      a pointer is sound only where no collection can happen. *)
+   let worth_carrying _ linear =
+@@ -1433,6 +1546,7 @@ let vector_pointers ~duplicated ~label ~expr =
+       if List.compare_length_with args arity <> 0 then raise Not_applicable)
+     exits;
+   let dbg = handler.dbg in
++  let out = outbound_of_handler ~node:expr handler in
+   let bound_inside = bound_variables V.Set.empty expr in
+   let invariant v = not (V.Set.mem v bound_inside) in
+   let defs = defs_of_body ~duplicated handler.body in
+@@ -1519,12 +1633,15 @@ let vector_pointers ~duplicated ~label ~expr =
+                             dbg )))
+           in
+           let rec loop expr =
+-            match expr with
+-            | Cop ((Cload _ as op), [address], dbg) ->
+-              Cop (op, [rewrite_address dbg (loop address)], dbg)
+-            | Cop ((Cstore _ as op), [address; value], dbg) ->
+-              Cop (op, [rewrite_address dbg (loop address); loop value], dbg)
+-            | _ -> map_subexpressions loop expr
++            skip_outbound ~out
++              (fun expr ->
++                match expr with
++                | Cop ((Cload _ as op), [address], dbg) ->
++                  Cop (op, [rewrite_address dbg (loop address)], dbg)
++                | Cop ((Cstore _ as op), [address; value], dbg) ->
++                  Cop (op, [rewrite_address dbg (loop address); loop value], dbg)
++                | _ -> map_subexpressions loop expr)
++              expr
+           in
+           let handler_body = loop handler.body in
+           match !pointers with
+@@ -1707,18 +1824,26 @@ let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
+     && invariant_int ~invariant ~int_vars ~relaxed def
+     && affordable def
+   in
+-  let rec loop expr =
+-    match expr with
+-    | Clet (v, def, inner) when hoistable (VP.var v) def ->
+-      hoisted := (VP.var v, def) :: !hoisted;
+-      already := V.Set.add (VP.var v) !already;
+-      loop inner
+-    | _ -> map_subexpressions loop expr
++  (* A binding made on the way out of the loop may follow a safepoint there,
++     where reading a pointer once before the loop is no longer the same as
++     reading it there, so the outbound parts are left alone. *)
++  let rec loop ~out expr =
++    skip_outbound ~out
++      (fun expr ->
++        match expr with
++        | Clet (v, def, inner) when hoistable (VP.var v) def ->
++          hoisted := (VP.var v, def) :: !hoisted;
++          already := V.Set.add (VP.var v) !already;
++          loop ~out inner
++        | _ -> map_subexpressions (loop ~out) expr)
++      expr
+   in
+   let handlers =
+     List.map
+       (fun (handler : static_handler) ->
+-        { handler with body = loop handler.body })
++        { handler with
++          body = loop ~out:(outbound_of_handler ~node:expr handler) handler.body
++        })
+       handlers
+   in
+   match !hoisted with
+@@ -2055,17 +2180,6 @@ let counted_guard ~duplicated ~int_vars ~expr (handler : static_handler) =
+   in
+   first 0 handler.params
+ 
+-let rec handler_labels acc expr =
+-  let acc =
+-    match expr with
+-    | Ccatch (_, handlers, _) ->
+-      List.map (fun (handler : static_handler) -> handler.label) handlers @ acc
+-    | _ -> acc
+-  in
+-  let acc = ref acc in
+-  iter_subexpressions (fun sub -> acc := handler_labels !acc sub) expr;
+-  !acc
+-
+ (* [Cexit] arguments are evaluated right to left; binding them to temporaries
+    has to keep that order. *)
+ let bind_right_to_left temps args body =
+@@ -2081,14 +2195,9 @@ let poll_on_exits ~dbg node =
+   match node with
+   | Ccatch (flag, handlers, body) ->
+     let inside = handler_labels [] node in
+-    let leaves (target : exit_label) =
+-      match target with
+-      | Return_lbl -> true
+-      | Lbl l -> not (List.exists (Static_label.equal l) inside)
+-    in
+     let rec loop expr =
+       match expr with
+-      | Cexit (target, args, traps) when leaves target ->
++      | Cexit (target, args, traps) when leaves ~inside target ->
+         let temps = List.map (fun _ -> V.create_local "exit_arg") args in
+         bind_right_to_left temps args
+           (Csequence
+@@ -2416,7 +2525,7 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+       (* Reading a variable once before the loop instead of once per iteration
+          is the same computation only where nothing can move it in between, and
+          a pointer may only be derived where nothing can move it at all. *)
+-      let gc_free = is_gc_free expr in
++      let gc_free = is_gc_free_loop expr in
+       let pipeline ?(gc_free = gc_free) ~form_interior_pointers ~carry_pointers
+           ~handlers expr =
+         let relaxed = form_interior_pointers && gc_free in
+@@ -2523,7 +2632,7 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+             | Some (body, lifted) -> (
+               let handler = { original with body } in
+               let node = Ccatch (Recursive, [handler], entry) in
+-              if not (is_gc_free node)
++              if not (is_gc_free_loop node)
+               then decline "a GC point inside"
+               else if pushes_a_trap node
+               then decline "an exception handler inside"
+@@ -2591,7 +2700,7 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+               None)
+             else
+               let pointer_passes =
+-                is_gc_free expr
++                is_gc_free_loop expr
+                 && (not (contains_polled_loop entry))
+                 && not
+                      (List.exists
+-- 
+2.47.3
+

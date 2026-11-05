@@ -1,0 +1,52 @@
+From f392ce70578ff22f5f55b3b697db0fd8722e3cb1 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:30 +0000
+Subject: [PATCH 20/24] 12-head-poll-for-polled-copy-of-versioned-loop
+
+---
+ backend/cmm_strength_reduction.ml | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index b8c74aa0a2..0130b51d56 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -2256,15 +2256,19 @@ let rec add_exit_polls ~in_polled_loop expr =
+    its header label alone: when the enclosing loop's header block is empty --
+    its body starts with the inner loop -- [Cfg_simplify] removes it, the
+    enclosing loop's back edge lands on the inner header, and its poll is lost.
+-   No derived pointer is live here: a loop with a polled loop inside is given
+-   no pointer passes. *)
++   No derived pointer is live here: a loop with a polled loop inside is given no
++   pointer passes.
++
++   The polled copy of a versioned loop is such a loop too, although it sits in
++   a node with the poll-free version ([add_slow_path]); it gets the same head
++   poll. No derived pointer is live at its head either: the bindings the
++   pipeline wraps around the node are read only by the poll-free version, and
++   a versioned node is never inside the poll-free version of an enclosing
++   counted loop, which replaces it by its own poll-free version
++   ([specialize]). *)
+ let rec poll_at_heads expr =
+   match expr with
+-  | Ccatch (Recursive, handlers, body)
+-    when not
+-           (List.exists
+-              (fun (handler : static_handler) -> handler.is_bounded)
+-              handlers) ->
++  | Ccatch (Recursive, handlers, body) ->
+     Ccatch
+       ( Recursive,
+         List.map
+@@ -2272,7 +2276,7 @@ let rec poll_at_heads expr =
+             let polled = poll_at_heads handler.body in
+             { handler with
+               body =
+-                (if contains_bounded_loop handler.body
++                (if (not handler.is_bounded) && contains_bounded_loop handler.body
+                  then Csequence (Cop (Cpoll, [], handler.dbg), polled)
+                  else polled)
+             })
+-- 
+2.47.3
+

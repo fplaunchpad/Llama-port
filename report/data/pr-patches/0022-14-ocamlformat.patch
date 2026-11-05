@@ -1,0 +1,1162 @@
+From f1f786d50896698575bc8ddf742f0ac06ddf65ba Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:30 +0000
+Subject: [PATCH 22/24] 14-ocamlformat
+
+---
+ backend/cfg/cfg_simplify.ml        |   4 +-
+ backend/cfg_selectgen.ml           |  40 +-
+ backend/cmm_strength_reduction.ml  | 583 ++++++++++++++---------------
+ backend/cmm_strength_reduction.mli |  50 +--
+ driver/oxcaml_args.ml              |  22 +-
+ 5 files changed, 357 insertions(+), 342 deletions(-)
+
+diff --git a/backend/cfg/cfg_simplify.ml b/backend/cfg/cfg_simplify.ml
+index df8f30a880..089afd9e31 100644
+--- a/backend/cfg/cfg_simplify.ml
++++ b/backend/cfg/cfg_simplify.ml
+@@ -145,8 +145,8 @@ end = struct
+               Printf.printf "block at %s has single successor %s\n"
+                 (Label.to_string label)
+                 (Label.to_string target_label);
+-            (* A loop header recorded as bounded may be an empty block that
+-               only jumps into the loop body; dropping it moves the back edge's
++            (* A loop header recorded as bounded may be an empty block that only
++               jumps into the loop body; dropping it moves the back edge's
+                destination to that body, so the mark has to move with it or
+                [Cfg_polling] will no longer recognise the loop. *)
+             if Label.Set.mem label cfg.bounded_loop_headers
+diff --git a/backend/cfg_selectgen.ml b/backend/cfg_selectgen.ml
+index 782fc76ca7..51b2656cff 100644
+--- a/backend/cfg_selectgen.ml
++++ b/backend/cfg_selectgen.ml
+@@ -26,11 +26,11 @@ module DLL = Doubly_linked_list
+ module Or_never_returns = Select_utils.Or_never_returns
+ module SU = Select_utils
+ 
+-(* Headers of counted loops in the function being translated.  The
+-   handler labels are minted during selection but the [Cfg.t] only exists at
+-   the end of it, so they are collected here and transferred in
+-   [emit_fundecl]. *)
++(* Headers of counted loops in the function being translated. The handler labels
++   are minted during selection but the [Cfg.t] only exists at the end of it, so
++   they are collected here and transferred in [emit_fundecl]. *)
+ let bounded_loop_headers = ref Label.Set.empty
++
+ module V = Backend_var
+ module VP = Backend_var.With_provenance
+ open SU.Or_never_returns.Syntax
+@@ -1277,8 +1277,14 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
+       body =
+     let handlers =
+       List.map
+-        (fun Cmm.{ label = nfail; params = ids; body = e2; dbg; is_cold;
+-                   is_bounded } ->
++        (fun Cmm.
++               { label = nfail;
++                 params = ids;
++                 body = e2;
++                 dbg;
++                 is_cold;
++                 is_bounded
++               } ->
+           let rs =
+             List.map
+               (fun (id, typ) ->
+@@ -1419,12 +1425,12 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
+         (* Ccatch registers must not contain out of heap pointers: a derived
+            pointer live across the back edge of a loop is live across that
+            loop's poll, and the collector cannot update it. Where there is no
+-           safepoint there is no such poll, and [Cmm_strength_reduction]
+-           carries row pointers only across loops it has also shown cannot
+-           allocate. That holds when the unit is compiled without polling, and
+-           for a loop it marked bounded, whose back edge [Cfg_polling] leaves
+-           alone. Emit.ml still refuses an [Addr] live at any frame
+-           descriptor, so a mistake is a compile error either way. *)
++           safepoint there is no such poll, and [Cmm_strength_reduction] carries
++           row pointers only across loops it has also shown cannot allocate.
++           That holds when the unit is compiled without polling, and for a loop
++           it marked bounded, whose back edge [Cfg_polling] leaves alone.
++           Emit.ml still refuses an [Addr] live at any frame descriptor, so a
++           mistake is a compile error either way. *)
+         let carried_pointers_are_safe =
+           (not Config.poll_insertion)
+           || !Oxcaml_flags.disable_poll_insertion
+@@ -1611,8 +1617,14 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
+   and emit_tail_catch env sub_cfg (flag : Cmm.ccatch_flag) handlers e1 =
+     let handlers =
+       List.map
+-        (fun Cmm.{ label = nfail; params = ids; body = e2; dbg; is_cold;
+-                   is_bounded } ->
++        (fun Cmm.
++               { label = nfail;
++                 params = ids;
++                 body = e2;
++                 dbg;
++                 is_cold;
++                 is_bounded
++               } ->
+           let rs =
+             List.map
+               (fun (id, typ) ->
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index 49265762ef..7d02d8d6a9 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -125,17 +125,19 @@ let occurrence_counts expr =
+ 
+ (* [counts] are the occurrence counts of the whole function as it was, and
+    [original] is one of its subexpressions, which the rewrite has turned into
+-   [current]. The counts of the function with [current] in place of
+-   [original]: rewriting the loops inside [original] first may have added
+-   reads (a fallback copy reads everything the loop it copies reads) or moved
+-   them. Rewrites elsewhere in the function are not accounted for; none of
+-   them takes away the last read of a variable that had one. *)
++   [current]. The counts of the function with [current] in place of [original]:
++   rewriting the loops inside [original] first may have added reads (a fallback
++   copy reads everything the loop it copies reads) or moved them. Rewrites
++   elsewhere in the function are not accounted for; none of them takes away the
++   last read of a variable that had one. *)
+ let corrected_counts ~counts ~original ~current =
+   let before = occurrence_counts original in
+   let after = occurrence_counts current in
+   let get map v = Option.value ~default:0 (V.Map.find_opt v map) in
+   let vars =
+-    V.Map.fold (fun v _ acc -> V.Set.add v acc) after
++    V.Map.fold
++      (fun v _ acc -> V.Set.add v acc)
++      after
+       (V.Map.fold (fun v _ acc -> V.Set.add v acc) counts V.Set.empty)
+   in
+   V.Set.fold
+@@ -366,15 +368,15 @@ let sum_candidates ~affines expr =
+   List.rev !acc
+ 
+ (* Where a sum [b + i] is used decides what carrying it saves. Carrying it
+-   replaces the addition by a register copy, and adds one addition per
+-   iteration on the back edge. That pays where the sum itself has to be
+-   materialised: on its own, or as the index of an address, where [base +
+-   scale * (b + i) + disp] has one register too many for an addressing mode.
+-   It does not pay where the sum is offset by a constant anywhere else: there
+-   the backend forms [b + i + c] with one [lea] from [b] and [i], exactly as it
+-   forms [s + c] from the carried [s], so carrying it only adds the back-edge
+-   addition and a live register. (A tagged index is such a sum: [a + i] on two
+-   tagged integers is [(a + i) - 1] in [Cmm].)
++   replaces the addition by a register copy, and adds one addition per iteration
++   on the back edge. That pays where the sum itself has to be materialised: on
++   its own, or as the index of an address, where [base + scale * (b + i) + disp]
++   has one register too many for an addressing mode. It does not pay where the
++   sum is offset by a constant anywhere else: there the backend forms [b + i +
++   c] with one [lea] from [b] and [i], exactly as it forms [s + c] from the
++   carried [s], so carrying it only adds the back-edge addition and a live
++   register. (A tagged index is such a sum: [a + i] on two tagged integers is
++   [(a + i) - 1] in [Cmm].)
+ 
+    The pairs returned are the sums used at least once where carrying them pays.
+    [Address] is the position of the index of an address. *)
+@@ -423,12 +425,12 @@ let rec replace_sum ~affines ~pair ~derived expr =
+   | Some _ | None ->
+     map_subexpressions (replace_sum ~affines ~pair ~derived) expr
+ 
+-(* At most this many values may be carried in integer registers by a loop
+-   that [reduce] adds a parameter to, its own parameters included. A carried
+-   sum replaces an invariant that dies, which is register-neutral only while
+-   the loop's values fit in registers; once they spill, a carried sum costs a
+-   load, an addition and a store per iteration where the sum it replaces cost
+-   a load and an addressing mode. *)
++(* At most this many values may be carried in integer registers by a loop that
++   [reduce] adds a parameter to, its own parameters included. A carried sum
++   replaces an invariant that dies, which is register-neutral only while the
++   loop's values fit in registers; once they spill, a carried sum costs a load,
++   an addition and a store per iteration where the sum it replaces cost a load
++   and an addressing mode. *)
+ let max_int_carried = 8
+ 
+ let is_int_register_machtype (machtype : machtype) =
+@@ -466,8 +468,8 @@ let loop_of ~label (expr : expression) =
+   | _ -> raise Not_applicable
+ 
+ (* The argument lists of every exit to the loop's handler from anywhere in the
+-   node. Raises [Not_applicable] if there is none, or one whose arity is not
+-   the handler's. *)
++   node. Raises [Not_applicable] if there is none, or one whose arity is not the
++   handler's. *)
+ let loop_exits loop =
+   let roots =
+     loop.entry
+@@ -524,9 +526,9 @@ let find_counter ~duplicated ~exits (handler : static_handler) =
+   in
+   first 0 handler.params
+ 
+-(* The node [loop] with [extra_params] appended to its handler's parameters,
+-   the handler's body replaced by [handler_body], and [extra args] appended to
+-   the arguments [args] of every exit to it. *)
++(* The node [loop] with [extra_params] appended to its handler's parameters, the
++   handler's body replaced by [handler_body], and [extra args] appended to the
++   arguments [args] of every exit to it. *)
+ let add_loop_params loop ~extra ~extra_params ~handler_body =
+   let label = loop.handler.label in
+   let handlers =
+@@ -803,13 +805,13 @@ let contains_polled_loop expr =
+       | _ -> false)
+     expr
+ 
+-(* Does [expr] look like it waits for another domain: spin on
+-   [Domain.cpu_relax] or on any atomic operation? Such a loop ends only when
+-   another domain acts, and that domain may itself be waiting for this one to
+-   poll -- to join a stop-the-world collection -- so without its poll the two
+-   deadlock. With polling on, [Domain.cpu_relax] is a bare [pause] that relies
+-   on the back-edge poll. This is a heuristic, not a proof: a loop that waits
+-   through a plain reference, a signal or a C call is not recognised. *)
++(* Does [expr] look like it waits for another domain: spin on [Domain.cpu_relax]
++   or on any atomic operation? Such a loop ends only when another domain acts,
++   and that domain may itself be waiting for this one to poll -- to join a
++   stop-the-world collection -- so without its poll the two deadlock. With
++   polling on, [Domain.cpu_relax] is a bare [pause] that relies on the back-edge
++   poll. This is a heuristic, not a proof: a loop that waits through a plain
++   reference, a signal or a C call is not recognised. *)
+ let waits_for_other_domains expr =
+   exists_sub
+     (function
+@@ -841,9 +843,9 @@ let rec has_tail_call expr =
+          handlers
+   | _ -> false
+ 
+-(* Does [expr] push an exception handler? An exit that pops it would poll
+-   before the pop, where an exception raised by a signal handler at that poll
+-   would reach a handler that no poll of the original loop could reach. *)
++(* Does [expr] push an exception handler? An exit that pops it would poll before
++   the pop, where an exception raised by a signal handler at that poll would
++   reach a handler that no poll of the original loop could reach. *)
+ let pushes_a_trap expr =
+   exists_sub
+     (function
+@@ -1031,10 +1033,10 @@ let scale_by n expr dbg =
+ 
+    Other targets: arm64 has no scaled-index addressing mode at all; its
+    instruction selection turns [base + (index << k)] into one shifted add, for
+-   any [k], followed by a load at a constant displacement. The rewritten
+-   address costs that one instruction there too, so restricting the step to
+-   the x86 scales only declines rewrites arm64 could also take; it does not
+-   make arm64 code worse. (Not tested: no arm64 build was available.) *)
++   any [k], followed by a load at a constant displacement. The rewritten address
++   costs that one instruction there too, so restricting the step to the x86
++   scales only declines rewrites arm64 could also take; it does not make arm64
++   code worse. (Not tested: no arm64 build was available.) *)
+ let is_addressing_scale n = n = 0 || n = 1 || n = 2 || n = 4 || n = 8
+ 
+ let same_base (root, invariant, bytes) (root', invariant', bytes') =
+@@ -1513,11 +1515,11 @@ let reduce_invariant_strides ~duplicated ~int_vars ~relaxed ~carry_pointers
+    nor the strength reduction see through it, and every access of a SIMD loop
+    pays its own untag and scale.
+ 
+-   The shift is still exact where it matters. For integers [y] and [q],
+-   [(y + 2q) >>s 1 = (y >>s 1) + q] whenever [y + 2q] does not overflow, and an
+-   index that addresses memory has not. Writing the index as [y + 2q], with [y]
+-   the part that varies plus the index's low bit, every access to one array at
+-   the same [y] is one pointer
++   The shift is still exact where it matters. For integers [y] and [q], [(y +
++   2q) >>s 1 = (y >>s 1) + q] whenever [y + 2q] does not overflow, and an index
++   that addresses memory has not. Writing the index as [y + 2q], with [y] the
++   part that varies plus the index's low bit, every access to one array at the
++   same [y] is one pointer
+ 
+    {v p = a + ((y >>s 1) << s) v}
+ 
+@@ -1542,9 +1544,9 @@ type vector_key =
+ let same_vector_key a b =
+   V.same a.vroot b.vroot
+   && (match a.vinv, b.vinv with
+-     | None, None -> true
+-     | Some u, Some v -> V.same u v
+-     | (None | Some _), _ -> false)
++    | None, None -> true
++    | Some u, Some v -> V.same u v
++    | (None | Some _), _ -> false)
+   && a.vcoefficient = b.vcoefficient
+   && a.vmultiplier = b.vmultiplier
+   && a.low_bit = b.low_bit && a.shift = b.shift
+@@ -1557,8 +1559,7 @@ let vector_address (expr : expression) =
+         [ Cvar root;
+           Cop
+             ( Clsl,
+-              [ Cop (Casr, [index; Cconst_int (1, _)], _);
+-                Cconst_int (shift, _) ],
++              [Cop (Casr, [index; Cconst_int (1, _)], _); Cconst_int (shift, _)],
+               _ ) ],
+         _ )
+     when shift >= 0 && shift <= 3 ->
+@@ -1586,78 +1587,76 @@ let vector_pointers ~duplicated ~label ~expr =
+     else
+       match counter_steps ~affines ~exits index with
+       | None -> None
+-      | Some steps ->
+-          let pointers = ref [] in
+-          let pointer_for key =
+-            match
+-              List.find_opt (fun (key', _) -> same_vector_key key key') !pointers
+-            with
+-            | Some (_, var) -> Some var
+-            | None ->
+-              if List.compare_length_with !pointers max_vector_pointers >= 0
+-              then None
+-              else
+-                let var = V.create_local "vp" in
+-                pointers := (key, var) :: !pointers;
+-                Some var
+-          in
+-          let rewrite_address dbg expr =
+-            match vector_address expr with
+-            | None -> expr
+-            | Some (root, index, shift) -> (
+-              if not (invariant root)
+-              then expr
+-              else
+-                match index_of ~affines ~defs ~invariant ~fuel:24 index with
+-                | None -> expr
+-                | Some { invariant = inv; coefficient; multiplier; offset } -> (
+-                  let exact =
+-                    multiplier <> 0
+-                    && List.for_all
+-                         (fun n ->
+-                           in_range (multiplier * n)
+-                           && (multiplier * n) land 1 = 0)
+-                         steps
++      | Some steps -> (
++        let pointers = ref [] in
++        let pointer_for key =
++          match
++            List.find_opt (fun (key', _) -> same_vector_key key key') !pointers
++          with
++          | Some (_, var) -> Some var
++          | None ->
++            if List.compare_length_with !pointers max_vector_pointers >= 0
++            then None
++            else
++              let var = V.create_local "vp" in
++              pointers := (key, var) :: !pointers;
++              Some var
++        in
++        let rewrite_address dbg expr =
++          match vector_address expr with
++          | None -> expr
++          | Some (root, index, shift) -> (
++            if not (invariant root)
++            then expr
++            else
++              match index_of ~affines ~defs ~invariant ~fuel:24 index with
++              | None -> expr
++              | Some { invariant = inv; coefficient; multiplier; offset } -> (
++                let exact =
++                  multiplier <> 0
++                  && List.for_all
++                       (fun n ->
++                         in_range (multiplier * n) && multiplier * n land 1 = 0)
++                       steps
++                in
++                let displacement = (offset asr 1) lsl shift in
++                if not (exact && in_range displacement)
++                then expr
++                else
++                  let key =
++                    { vroot = root;
++                      vinv = inv;
++                      vcoefficient = coefficient;
++                      vmultiplier = multiplier;
++                      low_bit = offset land 1;
++                      shift
++                    }
+                   in
+-                  let displacement = (offset asr 1) lsl shift in
+-                  if not (exact && in_range displacement)
+-                  then expr
+-                  else
+-                    let key =
+-                      { vroot = root;
+-                        vinv = inv;
+-                        vcoefficient = coefficient;
+-                        vmultiplier = multiplier;
+-                        low_bit = offset land 1;
+-                        shift
+-                      }
+-                    in
+-                    match pointer_for key with
+-                    | None -> expr
+-                    | Some var ->
+-                      if displacement = 0
+-                      then Cvar var
+-                      else
+-                        Cop
+-                          ( Cadda,
+-                            [Cvar var; Cconst_int (displacement, dbg)],
+-                            dbg )))
+-          in
+-          let rec loop expr =
+-            skip_outbound ~out
+-              (fun expr ->
+-                match expr with
+-                | Cop ((Cload _ as op), [address], dbg) ->
+-                  Cop (op, [rewrite_address dbg (loop address)], dbg)
+-                | Cop ((Cstore _ as op), [address; value], dbg) ->
+-                  Cop (op, [rewrite_address dbg (loop address); loop value], dbg)
+-                | _ -> map_subexpressions loop expr)
+-              expr
+-          in
+-          let handler_body = loop handler.body in
+-          match !pointers with
+-          | [] -> None
+-          | _ :: _ -> Some (index, affines, List.rev !pointers, handler_body)
++                  match pointer_for key with
++                  | None -> expr
++                  | Some var ->
++                    if displacement = 0
++                    then Cvar var
++                    else
++                      Cop
++                        (Cadda, [Cvar var; Cconst_int (displacement, dbg)], dbg)
++                ))
++        in
++        let rec loop expr =
++          skip_outbound ~out
++            (fun expr ->
++              match expr with
++              | Cop ((Cload _ as op), [address], dbg) ->
++                Cop (op, [rewrite_address dbg (loop address)], dbg)
++              | Cop ((Cstore _ as op), [address; value], dbg) ->
++                Cop (op, [rewrite_address dbg (loop address); loop value], dbg)
++              | _ -> map_subexpressions loop expr)
++            expr
++        in
++        let handler_body = loop handler.body in
++        match !pointers with
++        | [] -> None
++        | _ :: _ -> Some (index, affines, List.rev !pointers, handler_body))
+   in
+   let rec first index params =
+     match params with
+@@ -1740,7 +1739,9 @@ let max_hoisted = 4
+    for free, and spilling one value to save one [lea] is a loss. A multiply is,
+    at three to four cycles and a port the loop's arithmetic also wants. *)
+ let rec recompute_cost expr =
+-  let args_cost args = List.fold_left (fun n a -> n + recompute_cost a) 0 args in
++  let args_cost args =
++    List.fold_left (fun n a -> n + recompute_cost a) 0 args
++  in
+   match expr with
+   | Cconst_int _ | Cconst_natint _ | Cvar _ -> 0
+   | Cop (Cmuli, args, _) -> 3 + args_cost args
+@@ -1753,9 +1754,9 @@ let min_cost_under_pressure = 3
+ 
+ (* How many such bindings may leave one loop, and how many values that loop may
+    already carry before none may. The loop already ties up one register per
+-   carried value; below this there are enough left that one more live range
+-   does not force a spill, and above it the measurement that produced this pass
+-   says hoisting loses. *)
++   carried value; below this there are enough left that one more live range does
++   not force a spill, and above it the measurement that produced this pass says
++   hoisting loses. *)
+ let max_pressure_hoists = 2
+ 
+ let max_carried_under_pressure = 6
+@@ -1810,8 +1811,9 @@ let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
+     operands_die def
+     || recompute_cost def >= min_cost_under_pressure
+        && !pressure_budget > 0
+-       && (decr pressure_budget;
+-           true)
++       &&
++       (decr pressure_budget;
++        true)
+   in
+   let hoistable v def =
+     (not (V.Set.mem v duplicated))
+@@ -1851,9 +1853,9 @@ let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
+ 
+ (* {1 Counted loops}
+ 
+-   The poll on a loop's back edge is there so that the loop cannot keep a
+-   domain from a stop-the-world collection forever. Removing it changes nothing
+-   the loop computes; it only matters if the loop never ends. So a loop that is
++   The poll on a loop's back edge is there so that the loop cannot keep a domain
++   from a stop-the-world collection forever. Removing it changes nothing the
++   loop computes; it only matters if the loop never ends. So a loop that is
+    proved to end needs no back-edge poll: one poll on its exits gives the same
+    guarantee, and its body is then free to carry derived pointers.
+ 
+@@ -1866,22 +1868,21 @@ let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
+    exactly [d = m * n], whatever wraps. [B] is the same on every iteration.
+ 
+    - [x < B], [d > 0], given [B <= max - d + 1]: an iteration that continues has
+-     [x < B], so [x + d <= B - 1 + d <= max] does not wrap; [x] strictly rises
+-     while the loop continues, and the loop ends within [(B - x0) / d + 1]
+-     iterations. [x <= B] needs [B <= max - d]; [x > B] and [x >= B] with
+-     [d < 0] are the mirror images at [min].
+-   - [x <> B], [|d|] a power of two, given [x0 <= B] and [(B - x0) land (d - 1)
+-     = 0] (for [d > 0]; mirrored for [d < 0]): [x] stays a multiple of [d] below
+-     [B], so [x + d <= B] does not wrap, and [x] reaches [B] exactly after
+-     [(B - x0) / d] iterations. The low bits of [B - x0] are exact even when
+-     the subtraction wraps, because [d] divides 2^64.
+-   - [x = B]: [x] changes by [d <> 0] each iteration, so the test fails on the
+-     second iteration at the latest.
++   [x < B], so [x + d <= B - 1 + d <= max] does not wrap; [x] strictly rises
++   while the loop continues, and the loop ends within [(B - x0) / d + 1]
++   iterations. [x <= B] needs [B <= max - d]; [x > B] and [x >= B] with [d < 0]
++   are the mirror images at [min]. - [x <> B], [|d|] a power of two, given [x0
++   <= B] and [(B - x0) land (d - 1) = 0] (for [d > 0]; mirrored for [d < 0]):
++   [x] stays a multiple of [d] below [B], so [x + d <= B] does not wrap, and [x]
++   reaches [B] exactly after [(B - x0) / d] iterations. The low bits of [B - x0]
++   are exact even when the subtraction wraps, because [d] divides 2^64. - [x =
++   B]: [x] changes by [d <> 0] each iteration, so the test fails on the second
++   iteration at the latest.
+ 
+    Without the side conditions none of this holds: [i < n] stepping by 16 never
+    ends if [n] is within 15 of [max], and [i <> n] never ends if [n - i] is odd
+-   and the step is 2. Where the side condition follows from the range of [B]
+-   it is decided here; otherwise it is tested once on entry, and the loop is
++   and the step is 2. Where the side condition follows from the range of [B] it
++   is decided here; otherwise it is tested once on entry, and the loop is
+    compiled twice: the poll-free version, and an exact copy of the original,
+    polls included, for when the test fails.
+ 
+@@ -1898,26 +1899,23 @@ type fn =
+             [lift_out]. *)
+     counted_loops : bool;  (** [-cmm-counted-loops] applies. *)
+     unchecked_loops : bool;
+-        (** [-cmm-unchecked-loops] applies: loops are made poll-free whether
+-            or not they terminate. This may cost liveness, never
+-            correctness. *)
++        (** [-cmm-unchecked-loops] applies: loops are made poll-free whether or
++            not they terminate. This may cost liveness, never correctness. *)
+     in_poll_error_function : bool;
+         (** The function is annotated [@poll error], and polls would otherwise
+-            be inserted: a counted loop is then made poll-free with no exit
+-            poll and no polled copy, since the function must not poll at
+-            all. *)
+-    mutable found_counted : bool;
+-        (** Some loop has lost its back-edge poll. *)
++            be inserted: a counted loop is then made poll-free with no exit poll
++            and no polled copy, since the function must not poll at all. *)
++    mutable found_counted : bool;  (** Some loop has lost its back-edge poll. *)
+     mutable versioning_budget : int;
+-        (** How many more [Cmm] nodes the fallback copies of loops with an
+-            entry check may add to the function. Each versioned loop of a
+-            nest is copied with the versioned loops inside it, so without a
+-            limit the code of a nest grows with the square of its depth. *)
++        (** How many more [Cmm] nodes the fallback copies of loops with an entry
++            check may add to the function. Each versioned loop of a nest is
++            copied with the versioned loops inside it, so without a limit the
++            code of a nest grows with the square of its depth. *)
+     mutable versioned_loops :
+       (Static_label.t * (expression * expression option)) list
+-        (** Loops with an entry check, by the label of their poll-free
+-            handler: the loop without its fallback copy, and the check if it
+-            does not read the counter's entry value. See [specialize]. *)
++        (** Loops with an entry check, by the label of their poll-free handler:
++            the loop without its fallback copy, and the check if it does not
++            read the counter's entry value. See [specialize]. *)
+   }
+ 
+ let word_max = Nativeint.max_int
+@@ -1930,7 +1928,8 @@ let add_exact a b =
+   if
+     Bool.equal (Nativeint.compare a 0n >= 0) (Nativeint.compare b 0n >= 0)
+     && not
+-         (Bool.equal (Nativeint.compare sum 0n >= 0)
++         (Bool.equal
++            (Nativeint.compare sum 0n >= 0)
+             (Nativeint.compare a 0n >= 0))
+   then None
+   else Some sum
+@@ -1950,9 +1949,7 @@ let rec range ~defs ~fuel (expr : expression) =
+     | Cconst_int (n, _) -> Some (Nativeint.of_int n, Nativeint.of_int n)
+     | Cconst_natint (n, _) -> Some (n, n)
+     | Cvar v -> (
+-      match V.Map.find_opt v defs with
+-      | Some def -> recurse def
+-      | None -> None)
++      match V.Map.find_opt v defs with Some def -> recurse def | None -> None)
+     | Cop (Casr, [e; Cconst_int (k, _)], _) when k >= 1 && k <= 63 ->
+       let lo, hi =
+         match recurse e with Some r -> r | None -> word_min, word_max
+@@ -2052,37 +2049,36 @@ let precondition ~defs ~dbg guard =
+     Check
+       { uses_start = true;
+         check =
+-      (fun start ->
+-        let x0 = apply_affine guard.affine start dbg in
+-        let before, distance =
+-          if d > 0
+-          then
+-            ( Cop (Ccmpi Cle, [x0; guard.bound], dbg),
+-              Cop (Csubi, [guard.bound; x0], dbg) )
+-          else
+-            ( Cop (Ccmpi Cge, [x0; guard.bound], dbg),
+-              Cop (Csubi, [x0; guard.bound], dbg) )
+-        in
+-        if abs d = 1
+-        then before
+-        else
+-          Cop
+-            ( Cand,
+-              [ before;
+-                Cop
+-                  ( Ccmpi Ceq,
+-                    [ Cop (Cand, [distance; Cconst_int (abs d - 1, dbg)], dbg);
+-                      Cconst_int (0, dbg) ],
+-                    dbg ) ],
+-              dbg ))
++          (fun start ->
++            let x0 = apply_affine guard.affine start dbg in
++            let before, distance =
++              if d > 0
++              then
++                ( Cop (Ccmpi Cle, [x0; guard.bound], dbg),
++                  Cop (Csubi, [guard.bound; x0], dbg) )
++              else
++                ( Cop (Ccmpi Cge, [x0; guard.bound], dbg),
++                  Cop (Csubi, [x0; guard.bound], dbg) )
++            in
++            if abs d = 1
++            then before
++            else
++              Cop
++                ( Cand,
++                  [ before;
++                    Cop
++                      ( Ccmpi Ceq,
++                        [ Cop
++                            (Cand, [distance; Cconst_int (abs d - 1, dbg)], dbg);
++                          Cconst_int (0, dbg) ],
++                        dbg ) ],
++                  dbg ))
+       }
+   | Clt | Cle | Cgt | Cge | Cne | Cult | Cugt | Cule | Cuge -> Never
+ 
+ let same_guard ((a1 : affine), c1, b1) ((a2 : affine), c2, b2) =
+   a1.multiplier = a2.multiplier
+-  && a1.offset = a2.offset
+-  && Stdlib.( = ) c1 c2
+-  && same_expression b1 b2
++  && a1.offset = a2.offset && Stdlib.( = ) c1 c2 && same_expression b1 b2
+ 
+ (* The guard of the loop [handler] of [expr], if it is a counted loop. *)
+ let counted_guard ~defs ~duplicated ~int_vars ~expr (handler : static_handler) =
+@@ -2111,9 +2107,7 @@ let counted_guard ~defs ~duplicated ~int_vars ~expr (handler : static_handler) =
+       in
+       match List.map step_of back_edges with
+       | Some n :: rest
+-        when List.for_all
+-               (function Some n' -> n' = n | None -> false)
+-               rest ->
++        when List.for_all (function Some n' -> n' = n | None -> false) rest -> (
+         let bound e = invariant_int ~invariant ~int_vars ~relaxed:true e in
+         (* [cond] as [x cmp bound] with [x] the affine side, if it is one. *)
+         let classify cond =
+@@ -2141,7 +2135,9 @@ let counted_guard ~defs ~duplicated ~int_vars ~expr (handler : static_handler) =
+             match classify cond with
+             | Some (affine, cmp, b) ->
+               walk ((affine, cmp, b) :: active) if_true;
+-              walk ((affine, negate_integer_comparison cmp, b) :: active) if_false
++              walk
++                ((affine, negate_integer_comparison cmp, b) :: active)
++                if_false
+             | None ->
+               walk active if_true;
+               walk active if_false)
+@@ -2172,12 +2168,12 @@ let counted_guard ~defs ~duplicated ~int_vars ~expr (handler : static_handler) =
+             dominating
+         in
+         (* A guard that needs no check beats one that does. *)
+-        (match
+-           List.find_opt
+-             (fun (_, pre) ->
+-               match pre with Always -> true | Never | Check _ -> false)
+-             proofs
+-         with
++        match
++          List.find_opt
++            (fun (_, pre) ->
++              match pre with Always -> true | Never | Check _ -> false)
++            proofs
++        with
+         | Some proof -> Some proof
+         | None -> ( match proofs with proof :: _ -> Some proof | [] -> None))
+       | _ -> None
+@@ -2232,16 +2228,19 @@ let poll_on_exits ~dbg node =
+         Csequence (Cop (Cpoll, [], dbg), Cvar result) )
+   | _ -> node
+ 
+-(* Add the exit polls of the counted loops that need them. A counted loop
+-   inside a loop that keeps its poll needs none: [Cfg_polling] puts a poll on
+-   that loop's back edge wherever a path through it reaches no safepoint, which
+-   a path through a counted loop now is, so the time to a poll stays bounded
+-   by one of its iterations. A counted loop inside another counted loop is
+-   covered by the outer one's exit poll. *)
++(* Add the exit polls of the counted loops that need them. A counted loop inside
++   a loop that keeps its poll needs none: [Cfg_polling] puts a poll on that
++   loop's back edge wherever a path through it reaches no safepoint, which a
++   path through a counted loop now is, so the time to a poll stays bounded by
++   one of its iterations. A counted loop inside another counted loop is covered
++   by the outer one's exit poll. *)
+ let rec add_exit_polls ~in_polled_loop expr =
+   match expr with
+   | Ccatch (Recursive, handlers, body) ->
+-    if List.exists (fun (handler : static_handler) -> handler.is_bounded) handlers
++    if
++      List.exists
++        (fun (handler : static_handler) -> handler.is_bounded)
++        handlers
+     then
+       if in_polled_loop
+       then expr
+@@ -2266,13 +2265,12 @@ let rec add_exit_polls ~in_polled_loop expr =
+    No derived pointer is live here: a loop with a polled loop inside is given no
+    pointer passes.
+ 
+-   The polled copy of a versioned loop is such a loop too, although it sits in
+-   a node with the poll-free version ([add_slow_path]); it gets the same head
++   The polled copy of a versioned loop is such a loop too, although it sits in a
++   node with the poll-free version ([add_slow_path]); it gets the same head
+    poll. No derived pointer is live at its head either: the bindings the
+-   pipeline wraps around the node are read only by the poll-free version, and
+-   a versioned node is never inside the poll-free version of an enclosing
+-   counted loop, which replaces it by its own poll-free version
+-   ([specialize]). *)
++   pipeline wraps around the node are read only by the poll-free version, and a
++   versioned node is never inside the poll-free version of an enclosing counted
++   loop, which replaces it by its own poll-free version ([specialize]). *)
+ let rec poll_at_heads expr =
+   match expr with
+   | Ccatch (Recursive, handlers, body) ->
+@@ -2283,7 +2281,9 @@ let rec poll_at_heads expr =
+             let polled = poll_at_heads handler.body in
+             { handler with
+               body =
+-                (if (not handler.is_bounded) && contains_bounded_loop handler.body
++                (if
++                   (not handler.is_bounded)
++                   && contains_bounded_loop handler.body
+                  then Csequence (Cop (Cpoll, [], handler.dbg), polled)
+                  else polled)
+             })
+@@ -2349,14 +2349,13 @@ let fresh_copy expr =
+   in
+   copy V.Map.empty expr
+ 
+-(* The fallback copies of a function's versioned loops may add at most
+-   [max versioning_floor (versioning_growth * size)] [Cmm] nodes, where [size]
+-   is the function's own ([fn.versioning_budget]). Innermost loops are
+-   versioned first, so a nest too deep for the budget keeps its inner levels
+-   counted and its outer levels polled. The floor lets the small functions
+-   that are a single nest version every level of a nest up to seven deep
+-   (tests/gen_compile.py); beyond
+-   that, or in a large function, growth is linear in the function's size
++(* The fallback copies of a function's versioned loops may add at most [max
++   versioning_floor (versioning_growth * size)] [Cmm] nodes, where [size] is the
++   function's own ([fn.versioning_budget]). Innermost loops are versioned first,
++   so a nest too deep for the budget keeps its inner levels counted and its
++   outer levels polled. The floor lets the small functions that are a single
++   nest version every level of a nest up to seven deep (tests/gen_compile.py);
++   beyond that, or in a large function, growth is linear in the function's size
+    instead of quadratic in the nest's depth. *)
+ let versioning_growth = 2
+ 
+@@ -2413,16 +2412,16 @@ let add_slow_path ~(original : static_handler) ~index ~pre node =
+    the loop around it could not be counted, and a nest such as attention --
+    positions, then a dot product per position -- polled once per position. A
+    check of [B] alone ([uses_start = false]) has the same value wherever it is
+-   evaluated inside a loop that binds none of [B]'s variables. So when the
+-   outer loop is counted, the inner check is moved to the outer loop's entry:
+-   inside the outer loop's poll-free version the inner loop runs poll-free
+-   with no check, and the outer loop's fallback copy keeps the inner loop as it
+-   was. This repeats outwards, so the poll-free region is the whole nest. *)
+-
+-(* [expr] in terms of variables bound outside a loop: every variable in
+-   [inside] is replaced by its definition. Only pure, total integer
+-   operations are allowed, so the result is the value [expr] has anywhere in
+-   the loop. [None] if that is not possible. *)
++   evaluated inside a loop that binds none of [B]'s variables. So when the outer
++   loop is counted, the inner check is moved to the outer loop's entry: inside
++   the outer loop's poll-free version the inner loop runs poll-free with no
++   check, and the outer loop's fallback copy keeps the inner loop as it was.
++   This repeats outwards, so the poll-free region is the whole nest. *)
++
++(* [expr] in terms of variables bound outside a loop: every variable in [inside]
++   is replaced by its definition. Only pure, total integer operations are
++   allowed, so the result is the value [expr] has anywhere in the loop. [None]
++   if that is not possible. *)
+ let lift_out ~defs ~inside expr =
+   let rec go ~fuel expr =
+     if fuel <= 0
+@@ -2505,23 +2504,23 @@ let with_lifted ~dbg pre lifted =
+   | Never, _ :: _ -> Never
+ 
+ (* -cmm-counted-loops-max-trips [cap]: the poll-free version also requires the
+-   loop to be within [cap] steps of its bound on entry, which bounds the time
+-   it can keep a stop-the-world collection waiting by [cap] iterations rather
+-   than by the loop's whole run.
+-
+-   With [x0] the guarded value on entry and [d] its step, a loop that passes
+-   the check [distance <=u cap * |d|], where [distance] is [B - x0] for [d > 0]
+-   and [x0 - B] for [d < 0] (wrapping), takes at most [cap] back edges: the
+-   termination proof already guarantees that [x] moves monotonically towards
+-   [B] without wrapping while the loop continues, so after [t] back edges the
+-   true difference is at least [t * |d|] while still positive, and that
+-   difference is the unsigned value of [distance]. If [x0] is already past
+-   [B] the guard fails on the first iteration whatever the check says. An
+-   equality guard ends within two iterations and needs no check.
+-
+-   The check reads the counter's entry value, so it cannot be lifted out of
+-   an enclosing loop ([specialize]): with a cap, a nest is counted only at
+-   its innermost capped level, and the loops around it keep their polls. *)
++   loop to be within [cap] steps of its bound on entry, which bounds the time it
++   can keep a stop-the-world collection waiting by [cap] iterations rather than
++   by the loop's whole run.
++
++   With [x0] the guarded value on entry and [d] its step, a loop that passes the
++   check [distance <=u cap * |d|], where [distance] is [B - x0] for [d > 0] and
++   [x0 - B] for [d < 0] (wrapping), takes at most [cap] back edges: the
++   termination proof already guarantees that [x] moves monotonically towards [B]
++   without wrapping while the loop continues, so after [t] back edges the true
++   difference is at least [t * |d|] while still positive, and that difference is
++   the unsigned value of [distance]. If [x0] is already past [B] the guard fails
++   on the first iteration whatever the check says. An equality guard ends within
++   two iterations and needs no check.
++
++   The check reads the counter's entry value, so it cannot be lifted out of an
++   enclosing loop ([specialize]): with a cap, a nest is counted only at its
++   innermost capped level, and the loops around it keep their polls. *)
+ let with_trip_cap ~dbg (guard : guard) pre =
+   let cap = !Oxcaml_flags.cmm_counted_loops_max_trips in
+   let d = abs guard.step in
+@@ -2626,7 +2625,7 @@ let rec rewrite (config : config) int_vars expr =
+     let expr = Ccatch (flag, handlers, rewrite int_vars body) in
+     match flag with
+     | Normal | Exn_handler -> expr
+-    | Recursive ->
++    | Recursive -> (
+       (* Reading a variable once before the loop instead of once per iteration
+          is the same computation only where nothing can move it in between, and
+          a pointer may only be derived where nothing can move it at all. *)
+@@ -2654,10 +2653,10 @@ let rec rewrite (config : config) int_vars expr =
+             | exception Not_applicable -> [], expr
+         in
+         (* Interior pointers next. Where they fire they subsume the strength
+-           reduction: a fixed base plus the loop counter is strictly better than a
+-           running index, and the sum [b + i] the strength reduction looks for is
+-           gone from the addresses it rewrote, so the two cannot both fire on one
+-           access and leave the loop carrying both. *)
++           reduction: a fixed base plus the loop counter is strictly better than
++           a running index, and the sum [b + i] the strength reduction looks for
++           is gone from the addresses it rewrote, so the two cannot both fire on
++           one access and leave the loop carrying both. *)
+         let bindings, expr =
+           if not form_interior_pointers
+           then [], expr
+@@ -2685,9 +2684,9 @@ let rec rewrite (config : config) int_vars expr =
+               handlers expr
+         in
+         (* The row loop above an interior pointer steps it by a multiple of the
+-           row length, which is a loop-invariant value rather than a constant, so
+-           [reduce] cannot carry it and every row rebuilds the pointer from the
+-           row index. *)
++           row length, which is a loop-invariant value rather than a constant,
++           so [reduce] cannot carry it and every row rebuilds the pointer from
++           the row index. *)
+         let bindings, expr =
+           if not (strength_reduction && invariant_strides && relaxed)
+           then bindings, expr
+@@ -2709,9 +2708,8 @@ let rec rewrite (config : config) int_vars expr =
+       let counted =
+         if
+           not
+-            (fn.counted_loops
+-            && (not fn.unchecked_loops)
+-            && not form_interior_pointers)
++            (fn.counted_loops && (not fn.unchecked_loops)
++           && not form_interior_pointers)
+         then None
+         else
+           match expr, handlers with
+@@ -2722,7 +2720,8 @@ let rec rewrite (config : config) int_vars expr =
+               None
+             in
+             match
+-              specialize ~fn ~inside:(bound_variables V.Set.empty expr)
++              specialize ~fn
++                ~inside:(bound_variables V.Set.empty expr)
+                 original.body
+             with
+             | None -> decline "an inner loop's entry check cannot be lifted"
+@@ -2751,8 +2750,8 @@ let rec rewrite (config : config) int_vars expr =
+                   decline "an entry check, in a [@poll error] function"
+                 | Some (guard, pre) ->
+                   let pre = with_lifted ~dbg pre lifted in
+-                  (* A [@poll error] function promises never to poll, so it
+-                     gets no capped polled copy either. *)
++                  (* A [@poll error] function promises never to poll, so it gets
++                     no capped polled copy either. *)
+                   let pre, capped =
+                     if fn.in_poll_error_function
+                     then pre, false
+@@ -2766,22 +2765,21 @@ let rec rewrite (config : config) int_vars expr =
+                   if copy_size > fn.versioning_budget
+                   then decline "the fallback copy is over the size budget"
+                   else (
+-                  fn.versioning_budget <- fn.versioning_budget - copy_size;
+-                  report ~fn ~dbg
+-                    (Printf.sprintf "counted, %s%s%s"
+-                       (match pre with
+-                       | Always | Never -> "no entry check"
+-                       | Check _ -> "entry check")
+-                       (match lifted with
+-                       | [] -> ""
+-                       | _ :: _ ->
+-                         Printf.sprintf " (%d inner check(s) lifted)"
+-                           (List.length lifted))
+-                       (if capped then " (trip cap)" else ""));
+-                  Some (original, handler, node, guard, pre))))
++                    fn.versioning_budget <- fn.versioning_budget - copy_size;
++                    report ~fn ~dbg
++                      (Printf.sprintf "counted, %s%s%s"
++                         (match pre with
++                         | Always | Never -> "no entry check"
++                         | Check _ -> "entry check")
++                         (match lifted with
++                         | [] -> ""
++                         | _ :: _ ->
++                           Printf.sprintf " (%d inner check(s) lifted)"
++                             (List.length lifted))
++                         (if capped then " (trip cap)" else ""));
++                    Some (original, handler, node, guard, pre))))
+           | _, _ :: _ :: _ ->
+-            report ~fn
+-              ~dbg:(List.hd handlers).dbg
++            report ~fn ~dbg:(List.hd handlers).dbg
+               "not counted: several handlers";
+             None
+           | _, _ -> None
+@@ -2789,8 +2787,8 @@ let rec rewrite (config : config) int_vars expr =
+       (* Without the termination proof every loop loses its back-edge poll
+          except one that looks like it waits for another domain, and gets the
+          exit polls of a counted loop. Two more keep their poll because exit
+-         polls would change what they compute, not just when they poll: one
+-         with a tail call, which would stop being one, and one that pushes an
++         polls would change what they compute, not just when they poll: one with
++         a tail call, which would stop being one, and one that pushes an
+          exception handler, which an exit poll would sit inside of. Only a
+          GC-free loop with no polled loop inside is also given the pointer
+          passes: across a call, an allocation, or an inner loop's poll, a
+@@ -2843,7 +2841,8 @@ let rec rewrite (config : config) int_vars expr =
+         fn.found_counted <- true;
+         pipeline ~gc_free:true
+           ~form_interior_pointers:!Oxcaml_flags.cmm_interior_pointers
+-          ~carry_pointers:!Oxcaml_flags.cmm_carried_pointers ~handlers
++          ~carry_pointers:!Oxcaml_flags.cmm_carried_pointers
++          ~handlers
+           (Ccatch (Recursive, handlers, entry))
+       | Some (handlers, entry, false), _ ->
+         fn.found_counted <- true;
+@@ -2862,8 +2861,8 @@ let rec rewrite (config : config) int_vars expr =
+         let expr =
+           pipeline ~gc_free:true
+             ~form_interior_pointers:!Oxcaml_flags.cmm_interior_pointers
+-            ~carry_pointers:!Oxcaml_flags.cmm_carried_pointers ~handlers:[fast]
+-            expr
++            ~carry_pointers:!Oxcaml_flags.cmm_carried_pointers
++            ~handlers:[fast] expr
+         in
+         match pre with
+         | Always | Never -> expr
+@@ -2878,17 +2877,17 @@ let rec rewrite (config : config) int_vars expr =
+                    then None
+                    else Some (check (Cconst_int (0, original.dbg))) ) )
+                :: fn.versioned_loops;
+-          versioned))
++          versioned)))
+   | _ -> map_subexpressions (rewrite int_vars) expr
+ 
+ (* Interior pointers are only correct where no collection can happen, and
+    outside a counted loop a loop only escapes the back-edge poll of
+    [Cfg_polling] when polling is disabled for the whole unit. (A function
+    annotated [@poll error] does not escape it: [Cfg_polling] still inserts the
+-   poll, then rejects the function. There, only a counted loop can be
+-   poll-free; see [fn.in_poll_error_function].) Deciding it here rather than
+-   trusting the backend keeps the failure mode "the pass declines" instead of
+-   the backend's "bad GC root", which names no loop and no source location. *)
++   poll, then rejects the function. There, only a counted loop can be poll-free;
++   see [fn.in_poll_error_function].) Deciding it here rather than trusting the
++   backend keeps the failure mode "the pass declines" instead of the backend's
++   "bad GC root", which names no loop and no source location. *)
+ let polls_are_impossible (_ : fundecl) =
+   (not Config.poll_insertion) || !Oxcaml_flags.disable_poll_insertion
+ 
+@@ -2898,15 +2897,14 @@ let is_poll_error (fundecl : fundecl) =
+   | Lambda.Default_poll -> false
+ 
+ (* Does [Cfg_polling] put polls in this function? Dropping a back-edge poll
+-   needs one to drop, and the exit polls that replace it would be new
+-   safepoints in a function such as [caml_send*], which keeps a derived pointer
+-   live across its loop because it is never polled. *)
++   needs one to drop, and the exit polls that replace it would be new safepoints
++   in a function such as [caml_send*], which keeps a derived pointer live across
++   its loop because it is never polled. *)
+ let polls_are_inserted (fundecl : fundecl) =
+   (not (polls_are_impossible fundecl))
+   && (not (is_poll_error fundecl))
+   && not
+-       (Cfg_polling.function_is_assumed_to_never_poll
+-          fundecl.fun_name.sym_name)
++       (Cfg_polling.function_is_assumed_to_never_poll fundecl.fun_name.sym_name)
+ 
+ let fundecl (fundecl : fundecl) =
+   let strength_reduction = !Oxcaml_flags.cmm_strength_reduction in
+@@ -2957,8 +2955,7 @@ let fundecl (fundecl : fundecl) =
+         in_poll_error_function;
+         found_counted = false;
+         versioning_budget =
+-          max versioning_floor
+-            (versioning_growth * node_count fundecl.fun_body);
++          max versioning_floor (versioning_growth * node_count fundecl.fun_body);
+         versioned_loops = []
+       }
+     in
+diff --git a/backend/cmm_strength_reduction.mli b/backend/cmm_strength_reduction.mli
+index d640989eaf..d99c56201f 100644
+--- a/backend/cmm_strength_reduction.mli
++++ b/backend/cmm_strength_reduction.mli
+@@ -35,44 +35,44 @@
+       [b + i] of a loop-invariant [b] and an affine function [i] of a counter
+       that every exit steps by a constant or resets is carried in a new loop
+       parameter, so the addition leaves the loop. Only sums that the backend
+-      would have to materialise are carried, and only while the loop's
+-      integer values fit in registers.
++      would have to materialise are carried, and only while the loop's integer
++      values fit in registers.
+ 
+     - Interior pointers ([-no-cmm-interior-pointers]): in a loop that cannot
+       reach a safepoint, the invariant part of an array address is formed once
+       before the loop, as a derived pointer ([Addr]).
+ 
+-    - Invariant strides ([-no-cmm-invariant-strides], [-no-cmm-carried-pointers]):
+-      a value [start + stride * counter] with a loop-invariant [stride], possibly
+-      a derived pointer, is carried across the loop and stepped by one addition.
+-      Rows of unboxed vector arrays get the same treatment.
++    - Invariant strides ([-no-cmm-invariant-strides],
++      [-no-cmm-carried-pointers]): a value [start + stride * counter] with a
++      loop-invariant [stride], possibly a derived pointer, is carried across the
++      loop and stepped by one addition. Rows of unboxed vector arrays get the
++      same treatment.
+ 
+     - Loop-invariant code motion ([-no-cmm-licm]): pure, total integer bindings
+       whose operands are bound outside the loop are bound before it, when that
+-      does not add a live range the loop cannot afford. In a loop that may
+-      reach a safepoint, only bindings of integer operands are hoisted
++      does not add a live range the loop cannot afford. In a loop that may reach
++      a safepoint, only bindings of integer operands are hoisted
+       ([-no-cmm-licm-polled] turns that off).
+ 
+     - Counted loops ([-cmm-counted-loops], off by default): a GC-free loop whose
+       termination is proved (exactly, in 64-bit wrapping arithmetic; otherwise
+-      behind a check on entry and a polled copy of the loop) loses its
+-      back-edge poll and polls on its exits instead, and is then given the
+-      pointer passes even when the unit polls. [-cmm-unchecked-loops] does the
+-      same without the proof, at the cost of liveness only.
+-      [-cmm-counted-loops-max-trips n] also requires a counted loop to end
+-      within about [n] iterations, checked on entry, which bounds how long it
+-      can delay a stop-the-world collection. The polled copies made for entry
+-      checks may add at most twice the function's own size; a loop whose copy
+-      would exceed that keeps its poll.
++      behind a check on entry and a polled copy of the loop) loses its back-edge
++      poll and polls on its exits instead, and is then given the pointer passes
++      even when the unit polls. [-cmm-unchecked-loops] does the same without the
++      proof, at the cost of liveness only. [-cmm-counted-loops-max-trips n] also
++      requires a counted loop to end within about [n] iterations, checked on
++      entry, which bounds how long it can delay a stop-the-world collection. The
++      polled copies made for entry checks may add at most twice the function's
++      own size; a loop whose copy would exceed that keeps its poll.
+ 
+-    A derived pointer is never live across a safepoint: the pointer passes
+-    only act where none can occur (a unit compiled without polling, or a
+-    counted loop), and the emitter rejects an [Addr] live at a frame
+-    descriptor ("bad GC root"). [-dcounted-loops] prints each counted-loop
+-    decision, and [-dcmm-loops] the [Cmm] of each function after these passes.
++    A derived pointer is never live across a safepoint: the pointer passes only
++    act where none can occur (a unit compiled without polling, or a counted
++    loop), and the emitter rejects an [Addr] live at a frame descriptor ("bad GC
++    root"). [-dcounted-loops] prints each counted-loop decision, and
++    [-dcmm-loops] the [Cmm] of each function after these passes.
+ 
+-    The cost model is tuned for amd64 (addressing-mode scales, [lea]); on
+-    other 64-bit targets the rewrites are correct but untested. See the
+-    implementation for the exact conditions. *)
++    The cost model is tuned for amd64 (addressing-mode scales, [lea]); on other
++    64-bit targets the rewrites are correct but untested. See the implementation
++    for the exact conditions. *)
+ 
+ val fundecl : Cmm.fundecl -> Cmm.fundecl
+diff --git a/driver/oxcaml_args.ml b/driver/oxcaml_args.ml
+index 4cd314f8e2..c8aa054b5c 100644
+--- a/driver/oxcaml_args.ml
++++ b/driver/oxcaml_args.ml
+@@ -227,14 +227,13 @@ let mk_dcounted_loops f =
+     " Print which loops -cmm-counted-loops makes poll-free, and why not" )
+ 
+ let mk_no_cmm_counted_loops f =
+-  ( "-no-cmm-counted-loops",
+-    Arg.Unit f,
+-    " Keep the back-edge poll of every loop" )
++  ("-no-cmm-counted-loops", Arg.Unit f, " Keep the back-edge poll of every loop")
+ 
+ let mk_cmm_licm_polled f =
+   ( "-cmm-licm-polled",
+     Arg.Unit f,
+-    " Also bind loop-invariant integer computations before loops that keep their poll" )
++    " Also bind loop-invariant integer computations before loops that keep \
++     their poll" )
+ 
+ let mk_no_cmm_licm_polled f =
+   ( "-no-cmm-licm-polled",
+@@ -244,12 +243,15 @@ let mk_no_cmm_licm_polled f =
+ let mk_dcmm_loops f =
+   ( "-dcmm-loops",
+     Arg.Unit f,
+-    " Print the Cmm of each function after the loop passes (-dcmm prints it before)" )
++    " Print the Cmm of each function after the loop passes (-dcmm prints it \
++     before)" )
+ 
+ let mk_cmm_counted_loops_max_trips f =
+   ( "-cmm-counted-loops-max-trips",
+     Arg.Int f,
+-    "<n>  Make a counted loop poll-free only when it ends within about n iterations, checked on entry; otherwise run its polled copy (default 0: no limit)" )
++    "<n>  Make a counted loop poll-free only when it ends within about n \
++     iterations, checked on entry; otherwise run its polled copy (default 0: \
++     no limit)" )
+ 
+ let mk_cfg_stack_checks f =
+   ( "-cfg-stack-checks",
+@@ -2161,7 +2163,10 @@ module Oxcaml_options_impl = struct
+   let cmm_unchecked_loops = set' Oxcaml_flags.cmm_unchecked_loops
+   let no_cmm_unchecked_loops = clear' Oxcaml_flags.cmm_unchecked_loops
+   let dcounted_loops = set' Oxcaml_flags.dump_counted_loops
+-  let cmm_counted_loops_max_trips n = Oxcaml_flags.cmm_counted_loops_max_trips := n
++
++  let cmm_counted_loops_max_trips n =
++    Oxcaml_flags.cmm_counted_loops_max_trips := n
++
+   let dcmm_loops = set' Oxcaml_flags.dump_cmm_loops
+   let cmm_licm_polled = set' Oxcaml_flags.cmm_licm_polled
+   let no_cmm_licm_polled = clear' Oxcaml_flags.cmm_licm_polled
+@@ -2798,7 +2803,8 @@ module Extra_params = struct
+     | "cmm-licm" -> set' Oxcaml_flags.cmm_licm
+     | "cmm-counted-loops" -> set' Oxcaml_flags.cmm_counted_loops
+     | "cmm-unchecked-loops" -> set' Oxcaml_flags.cmm_unchecked_loops
+-    | "cmm-counted-loops-max-trips" -> set_int' Oxcaml_flags.cmm_counted_loops_max_trips
++    | "cmm-counted-loops-max-trips" ->
++        set_int' Oxcaml_flags.cmm_counted_loops_max_trips
+     | "cmm-licm-polled" -> set' Oxcaml_flags.cmm_licm_polled
+     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
+     | "cfg-eliminate-dead-trap-handlers" ->
+-- 
+2.47.3
+

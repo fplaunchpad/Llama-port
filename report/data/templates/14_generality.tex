@@ -1,0 +1,141 @@
+\section{Where the Optimisations Do and Do Not Apply}
+\label{sec:generality}
+
+nx-oxcaml shaped the generalised analysis of Section~\ref{sec:counted}, so it
+is a development workload, not an independent test. Two workloads the passes
+were not adjusted for follow: a standard kernel suite, which gains, and a
+cryptography code base, which does not. A port of the passes to stock OCaml
+comes first.
+
+\subsection{The Passes on Stock OCaml 5.3.0}
+\label{sec:stock}
+None of the passes depends on flambda2, so I ported them to OCaml 5.3.0.
+Stock OCaml polls every loop, so with default flags only strength reduction
+fires: the passes gain @P{ocaml_pr_off,ocaml_pr_all}@ on microgpt. Counted
+loops add @P{ocaml_pr_all,ocaml_pr_counted}@, for
+@P{ocaml_unsafe_unroll,ocaml_pr_counted}@ in all over stock OCaml, and the
+inner loop goes from 30 to 17 instructions per 4 multiply--adds. The best OxCaml build stays @P{ocaml_pr_counted,pr_counted}@
+ahead of the best OCaml build. OCaml's test suite (1,462 tests) gives the same
+result test by test with and without the patches, also with counted loops
+forced on.
+
+\subsection{A Held-Out Kernel Suite: PolyBench}
+\label{sec:polybench}
+PolyBench/C~\cite{polybench} is a standard suite of loop-nest kernels
+(linear algebra, stencils, data mining) written by others for compiler
+research. I ported 17 of its kernels to plain OCaml as an ordinary programmer
+would write them (flat row-major \code{float array}s, \code{for} loops,
+\code{-unsafe}) and to C, and ran them on the pull-request compiler in a
+separate 21-round run. All builds produce bit-identical results, and all
+84 loops in the timed kernels are counted (Table~\ref{tab:polybench}). The
+geometric-mean gain is $+19.7\%$ with array sizes fixed at compile time
+(gemm $+108\%$) and $+7.5\%$ with sizes known only at run time. The
+rules of Table~\ref{tab:applicability} predict that kernels whose inner loops
+index arrays as \code{base + m*counter + c} should gain, and kernels limited by
+memory bandwidth or a chain of dependent arithmetic should not.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{@{}lrrr@{}}
+    \toprule
+    kernel & counted loops vs passes off & inner-loop instructions & gap to scalar C \\
+    \midrule
+    gemm & $+108.2\%$ (21/21) & 19 $\to$ 8 & $2.24\times$ \\
+    jacobi-2d & $+49.6\%$ (21/21) & 21 $\to$ 11 & $1.43\times$ \\
+    fdtd-2d & $+48.7\%$ (21/21) & 18--22 $\to$ 10--12 & $1.34\times$ \\
+    syrk & $+42.6\%$ (21/21) & 20 $\to$ 11 & $2.34\times$ \\
+    doitgen & $+33.5\%$ (21/21) & 21 $\to$ 11 & $3.16\times$ \\
+    floyd-warshall & $+26.2\%$ (21/21) & 23 $\to$ 15 & $2.12\times$ \\
+    heat-3d & $+16.6\%$ (21/21) & 38 $\to$ 31 & $1.49\times$ \\
+    atax & $+15.0\%$ (20/21) & 15 $\to$ 7 & $2.26\times$ \\
+    2mm & $+10.5\%$ (20/21) & 19 $\to$ 11 & $3.65\times$ \\
+    8 others & $-0.7$ to $+6.4\%$ & & $1.18$--$2.84\times$ \\
+    \midrule
+    geometric mean, 17 kernels & $+19.7\%$ & & $2.03\times$ \\
+    \quad same 17 kernels, sizes known only at run time & $+7.5\%$ & & \\
+    \bottomrule
+  \end{tabular}
+  \caption{PolyBench in plain OCaml with \texttt{-unsafe}: the passes with
+  counted loops against the passes off, polls on in both (paired median,
+  rounds won; sizes fixed at compile time unless noted). Two
+  byte-identical builds differed by $-0.5$ to $+2.1\%$ per kernel. Others:
+  gemver, trmm, mvt, gesummv, bicg, seidel-2d, covariance, correlation.}
+  \label{tab:polybench}
+\end{table}
+
+The prediction holds. Gains are large where an inner loop indexes several
+two-dimensional arrays this way (gemm, the stencils, syrk, doitgen) and the
+passes remove most of its instructions, which counted loops allow by moving
+the poll to the exit. Gains are small where something else
+limits the loop: matrix--vector kernels on 32--64\,MB matrices that wait on
+memory, column-strided access, and seidel-2d, whose loop shrinks from 37 to 15
+instructions for only $+2\%$ because each update waits for the previous one.
+
+Two further results bound the claim. With sizes known only at run time the
+gain is $+7.5\%$: constant sizes let the compiler fold each row stride into
+the loop,
+while run-time strides stay as multiplications inside it and add register
+pressure, so the passes remove a smaller share of its work (gemm's
+loop shrinks from 30 to 27 instructions instead of 19 to 8). And OCaml stays
+$2.03\times$ behind scalar C, because GCC keeps array-element accumulators in
+registers and unrolls and interleaves the gemm loop, which no OCaml pass does.
+
+\subsection{The oxcaml-crypto-study Repository}
+\label{sec:crypto}
+oxcaml-crypto-study~\cite{crypto_study} asks whether OxCaml can implement
+cryptographic primitives natively, at Rust-like speed, instead of binding to C.
+Its one primitive, ChaCha20~\cite{rfc8439}, exists as a boxed plain-OCaml
+version and an OxCaml version with unboxed \texttt{int32\#} arrays,
+stack-allocated state and \code{[@zero_alloc]}. I compiled both with the
+pull-request compiler in eight configurations (the polling modes, each with
+and without the pointer passes) and timed encryption of 1\,MiB\,+\,37 bytes
+over 15 interleaved rounds; all passed the RFC~8439 test vector.
+
+\subsection{Result: No Measurable Effect}
+In every polling mode the assembly is \emph{byte-identical} with the four
+passes on or off; the flags only drop back-edge polls in nine loops. The best
+configuration measured $\times1.019$ (12/15 rounds), while two byte-identical
+builds differed by 1.7\%, for four reasons:
+
+\begin{enumerate}
+  \item \textbf{Byte offsets, not array elements.} The hot XOR loop's
+        \code{Bytes.get_int32_le plaintext (j*64 + i*4)} untags a byte offset
+        with a \emph{right} shift and adds it unscaled; the passes match
+        addresses scaled by a left shift.
+  \item \textbf{The invariant is not a variable.} flambda2 inlines
+        \code{j * 64} into the address as \code{(<< j 6)}; writing
+        \code{let base = j * 64} gave byte-identical assembly.
+  \item \textbf{The other loops are already optimal or not GC-free.} The copy
+        and add loops index by the bare counter, the round loop calls a
+        non-inlined function, and the boxed version allocates on every store.
+  \item \textbf{The ceiling is low.} Each block makes 80 calls to a
+        94-instruction quarter-round, about 7,500 instructions, against
+        roughly 600 in loops the passes could touch.
+\end{enumerate}
+
+\subsection{An Applicability Characterisation}
+Table~\ref{tab:applicability} summarises the results: the passes recover
+C-style pointer walking over arrays, helping code whose cost is index
+arithmetic and doing nothing for code whose cost is the computation itself.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabularx}{\textwidth}{@{}lXX@{}}
+    \toprule
+    property & benefits & does not benefit \\
+    \midrule
+    addressing & array index \code{base + m*counter + c}, scaled by a left shift & byte offsets into \code{Bytes}; an index that is the bare counter \\
+    invariant part & a variable bound before the loop, or a loop-invariant stride & an invariant product inlined into the address \\
+    GC-freedom & no allocation or non-inlined call; polls moved to exits by counted loops & loops that call functions or box values \\
+    where time goes & inner loops dominated by address arithmetic & arithmetic reached through calls; compute-bound kernels \\
+    registers & free registers for the carried pointers & loops at the register limit \\
+    \bottomrule
+  \end{tabularx}
+  \caption{When the Cmm loop passes apply.}
+  \label{tab:applicability}
+\end{table}
+
+A vectorised ChaCha20, or number-theoretic transforms indexing
+\code{a.(j + len)}, have the shapes the passes handle.

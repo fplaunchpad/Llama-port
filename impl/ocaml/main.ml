@@ -13,7 +13,7 @@
    variant (flambda2 middle-end, -O3); this one is built by the upstream compiler
    from a plain opam switch (closure middle-end, where -O3 does not exist). Neither
    file uses any OxCaml language extension - no modes, no unboxed types, no locality
-   annotations - so both compilers accept both files. See OPTIMIZATIONS.md.
+   annotations - so both compilers accept both files. See README.md, sec. 2
 
    OCaml notes relevant to the numerics contract:
      - [float] is IEEE double, and [float array] is unboxed and flat, so the layout

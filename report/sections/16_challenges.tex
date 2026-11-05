@@ -1,0 +1,39 @@
+\section{Notable Engineering Challenges}
+\label{sec:challenges}
+
+\subsection{Challenge 1: Keeping the Reference Arithmetic Identical}
+CPython's compensated \code{sum()} (Table~\ref{tab:bugs}) changed the weight
+checksum by only $5\times10^{-15}$ relative and left the generated text
+unchanged. Comparing outputs cannot reveal such a difference; checking each
+port against the numerical contract can, and checksums are compared exactly.
+
+\subsection{Challenge 2: Measuring on a Hybrid Laptop}
+Without care, ratios on a hybrid laptop vary by almost $3\times$ between runs,
+and subtler effects bias a comparison: perplexity run after generation in the
+same process slows 1.5 times, and C++ at \code{-O2} against Rust at opt-level
+3 favours Rust by 20\%. The protocol of Section~\ref{sec:method}, explicit
+compiler paths, and requiring the two modes to agree make such effects
+visible.
+
+\subsection{Challenge 3: Testing Each Explanation}
+Each plausible explanation became a prediction measured before it was used:
+the gap is not SIMD (Section~\ref{sec:stage2}), the poll's cost is not the
+\reg{r11} spill (Section~\ref{sec:r11}), and nx-oxcaml's kernels were limited
+by address arithmetic, not memory (Section~\ref{sec:counted}).
+
+\subsection{Challenge 4: Keeping the Gains With Safepoints}
+The pointer passes need loops without polls, and the release configuration
+puts a poll on every back edge (Section~\ref{sec:reality}). Measured only on
+compilers built without polls, the passes would overstate what users get.
+Counted loops recover the gain while keeping the collector safe and every
+proved loop reaching a poll: polls move to loop exits, and the cost is pause
+latency, which an optional trip cap bounds in iterations, not in time.
+
+\subsection{Challenge 5: Keeping Pointer Optimisations Safe}
+The \code{bad GC root} check, which turns any derived pointer live at a
+safepoint into a compile-time error, shaped the design: it rules out carrying
+a pointer across a nested loop's poll, a polled loop inside a counted loop's
+entry check, and exit polls in the runtime's never-polled helpers. What no
+compile-time check catches, a loop waiting on another domain, counted loops
+exclude by requiring a termination proof; unchecked mode handles only some
+such loops, so it stays opt-in (Section~\ref{sec:counted}).

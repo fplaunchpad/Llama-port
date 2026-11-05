@@ -1,0 +1,183 @@
+From a6e70e62ba28d7a921aa323c860c1940e9441c01 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:29 +0000
+Subject: [PATCH 10/24] 02-poll-error-counted-loops
+
+---
+ backend/cfg_selectgen.ml          | 13 ++-------
+ backend/cmm_strength_reduction.ml | 48 ++++++++++++++++++++++---------
+ backend/select_utils.ml           |  7 -----
+ backend/select_utils.mli          |  2 --
+ 4 files changed, 38 insertions(+), 32 deletions(-)
+
+diff --git a/backend/cfg_selectgen.ml b/backend/cfg_selectgen.ml
+index 87b30d9fb7..782fc76ca7 100644
+--- a/backend/cfg_selectgen.ml
++++ b/backend/cfg_selectgen.ml
+@@ -1422,19 +1422,13 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
+            safepoint there is no such poll, and [Cmm_strength_reduction]
+            carries row pointers only across loops it has also shown cannot
+            allocate. That holds when the unit is compiled without polling, and
+-           equally when this one function is annotated [@poll error], which
+-           makes any remaining polling point a compile error -- so a kernel can
+-           opt in without the program around it giving up its safepoints.
+-           Emit.ml still refuses an [Addr] live at any frame descriptor, so a
+-           mistake is a compile error either way. *)
++           for a loop it marked bounded, whose back edge [Cfg_polling] leaves
++           alone. Emit.ml still refuses an [Addr] live at any frame
++           descriptor, so a mistake is a compile error either way. *)
+         let carried_pointers_are_safe =
+           (not Config.poll_insertion)
+           || !Oxcaml_flags.disable_poll_insertion
+           || Label.Set.mem handler.label !bounded_loop_headers
+-          ||
+-          match !SU.current_function_poll with
+-          | Lambda.Error_poll -> true
+-          | Lambda.Default_poll -> false
+         in
+         Array.iter
+           (fun reg ->
+@@ -1775,7 +1769,6 @@ module Make (Target : Cfg_selectgen_target_intf.S) = struct
+ 
+   let emit_fundecl ~future_funcnames f =
+     SU.current_function_name := f.Cmm.fun_name.sym_name;
+-    SU.current_function_poll := f.Cmm.fun_poll;
+     bounded_loop_headers := Label.Set.empty;
+     SU.current_function_is_check_enabled
+       := Zero_alloc_checker.is_check_enabled f.Cmm.fun_codegen_options
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index 95870a5165..1cbfea3c5f 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -1774,6 +1774,11 @@ let counted_loops_enabled = ref false
+    terminate. This may cost liveness, never correctness. *)
+ let unchecked_loops_enabled = ref false
+ 
++(* The function being compiled is annotated [@poll error], and polls would
++   otherwise be inserted: a counted loop is then made poll-free with no exit
++   poll and no polled copy, since the function must not poll at all. *)
++let in_poll_error_function = ref false
++
+ let found_counted = ref false
+ 
+ (* The [Clet] definitions of the whole function, for [range]. *)
+@@ -2527,6 +2532,14 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+               else
+                 match counted_guard ~duplicated ~int_vars ~expr:node handler with
+                 | None -> decline "no counter with a dominating guard"
++                | Some (_, pre)
++                  when !in_poll_error_function
++                       &&
++                       match with_lifted ~dbg pre lifted with
++                       | Check _ -> true
++                       | Always | Never -> false ->
++                  (* The fallback copy polls, which [@poll error] forbids. *)
++                  decline "an entry check, in a [@poll error] function"
+                 | Some (guard, pre) ->
+                   let pre = with_lifted ~dbg pre lifted in
+                   report ~dbg
+@@ -2642,16 +2655,18 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+           versioned))
+   | _ -> map_subexpressions (rewrite int_vars) expr
+ 
+-(* Interior pointers are only correct where no collection can happen, and a loop
+-   only escapes the back-edge poll of [Cfg_polling] when polling is disabled for
+-   the whole unit or the function is annotated [@poll error], in which case any
+-   remaining polling point is a compile error. Deciding it here rather than
++(* Interior pointers are only correct where no collection can happen, and
++   outside a counted loop a loop only escapes the back-edge poll of
++   [Cfg_polling] when polling is disabled for the whole unit. (A function
++   annotated [@poll error] does not escape it: [Cfg_polling] still inserts the
++   poll, then rejects the function. There, only a counted loop can be
++   poll-free; see [in_poll_error_function].) Deciding it here rather than
+    trusting the backend keeps the failure mode "the pass declines" instead of
+    the backend's "bad GC root", which names no loop and no source location. *)
+-let polls_are_impossible (fundecl : fundecl) =
+-  (not Config.poll_insertion)
+-  || !Oxcaml_flags.disable_poll_insertion
+-  ||
++let polls_are_impossible (_ : fundecl) =
++  (not Config.poll_insertion) || !Oxcaml_flags.disable_poll_insertion
++
++let is_poll_error (fundecl : fundecl) =
+   match fundecl.fun_poll with
+   | Lambda.Error_poll -> true
+   | Lambda.Default_poll -> false
+@@ -2662,6 +2677,7 @@ let polls_are_impossible (fundecl : fundecl) =
+    live across its loop because it is never polled. *)
+ let polls_are_inserted (fundecl : fundecl) =
+   (not (polls_are_impossible fundecl))
++  && (not (is_poll_error fundecl))
+   && not
+        (Cfg_polling.function_is_assumed_to_never_poll
+           fundecl.fun_name.sym_name)
+@@ -2675,16 +2691,22 @@ let fundecl (fundecl : fundecl) =
+   let licm = !Oxcaml_flags.cmm_licm in
+   (* A carried pointer is live across the loop's back edge, which is where a
+      poll would go, so it is only representable where that loop has no
+-     safepoint: either the whole unit is compiled without polling, or this
+-     function is annotated [@poll error]. [Cfg_selectgen] admits an [Addr] in a
+-     [Ccatch] register under exactly the same condition. *)
++     safepoint: either the whole unit is compiled without polling, or the loop
++     is a counted one. [Cfg_selectgen] admits an [Addr] in a [Ccatch] register
++     under exactly the same condition. *)
+   let carry_pointers =
+     !Oxcaml_flags.cmm_carried_pointers && polls_are_impossible fundecl
+   in
+   (* The proofs above are about 64-bit words, computed with a 64-bit host. *)
++  in_poll_error_function
++    := is_poll_error fundecl
++       && (not (polls_are_impossible fundecl))
++       && not
++            (Cfg_polling.function_is_assumed_to_never_poll
++               fundecl.fun_name.sym_name);
+   counted_loops_enabled
+     := !Oxcaml_flags.cmm_counted_loops
+-       && polls_are_inserted fundecl
++       && (polls_are_inserted fundecl || !in_poll_error_function)
+        && Arch.size_int = 8 && Nativeint.size = 64;
+   unchecked_loops_enabled
+     := !Oxcaml_flags.cmm_unchecked_loops && polls_are_inserted fundecl;
+@@ -2708,7 +2730,7 @@ let fundecl (fundecl : fundecl) =
+         fundecl.fun_body
+     in
+     let body =
+-      if !found_counted
++      if !found_counted && not !in_poll_error_function
+       then poll_at_heads (add_exit_polls ~in_polled_loop:false body)
+       else body
+     in
+diff --git a/backend/select_utils.ml b/backend/select_utils.ml
+index 8ab9db65d9..fbd4e3e4e1 100644
+--- a/backend/select_utils.ml
++++ b/backend/select_utils.ml
+@@ -375,13 +375,6 @@ let current_function_name = ref ""
+ 
+ let current_function_is_check_enabled = ref false
+ 
+-(* Poll attribute of the function being compiled. A function annotated
+-   [@poll error] is rejected by [Cfg_polling] if it needs a safepoint at all,
+-   so inside one there is no point at which the collector can run and no
+-   derived pointer it could fail to update. Tracking it per function is what
+-   lets a single kernel opt in without the whole unit giving up polling. *)
+-let current_function_poll = ref Lambda.Default_poll
+-
+ module Effect = struct
+   type t =
+     | None
+diff --git a/backend/select_utils.mli b/backend/select_utils.mli
+index 062226fc33..be928a6b1b 100644
+--- a/backend/select_utils.mli
++++ b/backend/select_utils.mli
+@@ -126,8 +126,6 @@ val current_function_name : string ref
+ 
+ val current_function_is_check_enabled : bool ref
+ 
+-val current_function_poll : Lambda.poll_attribute ref
+-
+ module Effect : sig
+   type t =
+     | None
+-- 
+2.47.3
+

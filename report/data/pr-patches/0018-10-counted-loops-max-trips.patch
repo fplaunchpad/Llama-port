@@ -1,0 +1,186 @@
+From 9c2730412050d531968f07fd8fd98d1d30551197 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:29 +0000
+Subject: [PATCH 18/24] 10-counted-loops-max-trips
+
+---
+ backend/cmm_strength_reduction.ml | 57 +++++++++++++++++++++++++++++--
+ driver/oxcaml_args.ml             |  9 +++++
+ driver/oxcaml_args.mli            |  1 +
+ driver/oxcaml_flags.ml            |  3 ++
+ driver/oxcaml_flags.mli           |  2 ++
+ 5 files changed, 70 insertions(+), 2 deletions(-)
+
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index 786d2b56ab..b9af2487ac 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -2469,6 +2469,51 @@ let with_lifted ~dbg pre lifted =
+       }
+   | Never, _ :: _ -> Never
+ 
++(* -cmm-counted-loops-max-trips [cap]: the poll-free version also requires the
++   loop to be within [cap] steps of its bound on entry, which bounds the time
++   it can keep a stop-the-world collection waiting by [cap] iterations rather
++   than by the loop's whole run.
++
++   With [x0] the guarded value on entry and [d] its step, a loop that passes
++   the check [distance <=u cap * |d|], where [distance] is [B - x0] for [d > 0]
++   and [x0 - B] for [d < 0] (wrapping), takes at most [cap] back edges: the
++   termination proof already guarantees that [x] moves monotonically towards
++   [B] without wrapping while the loop continues, so after [t] back edges the
++   true difference is at least [t * |d|] while still positive, and that
++   difference is the unsigned value of [distance]. If [x0] is already past
++   [B] the guard fails on the first iteration whatever the check says. An
++   equality guard ends within two iterations and needs no check.
++
++   The check reads the counter's entry value, so it cannot be lifted out of
++   an enclosing loop ([specialize]): with a cap, a nest is counted only at
++   its innermost capped level, and the loops around it keep their polls. *)
++let with_trip_cap ~dbg (guard : guard) pre =
++  let cap = !Oxcaml_flags.cmm_counted_loops_max_trips in
++  let d = abs guard.step in
++  if cap <= 0 || d = 0 || cap > Int.max_int / d
++  then pre, false
++  else
++    match guard.continue_when, pre with
++    | Ceq, _ | _, Never -> pre, false
++    | _, (Always | Check _) ->
++      let limit = Cconst_natint (Nativeint.of_int (cap * d), dbg) in
++      let within start =
++        let x0 = apply_affine guard.affine start dbg in
++        let distance =
++          if guard.step > 0
++          then Cop (Csubi, [guard.bound; x0], dbg)
++          else Cop (Csubi, [x0; guard.bound], dbg)
++        in
++        Cop (Ccmpi Cule, [distance; limit], dbg)
++      in
++      let check =
++        match pre with
++        | Check { check; _ } ->
++          fun start -> Cop (Cand, [check start; within start], dbg)
++        | Always | Never -> within
++      in
++      Check { check; uses_start = true }, true
++
+ (* -dcounted-loops *)
+ let report ~fn ~dbg decision =
+   if !Oxcaml_flags.dump_counted_loops
+@@ -2671,8 +2716,15 @@ let rec rewrite (config : config) int_vars expr =
+                   decline "an entry check, in a [@poll error] function"
+                 | Some (guard, pre) ->
+                   let pre = with_lifted ~dbg pre lifted in
++                  (* A [@poll error] function promises never to poll, so it
++                     gets no capped polled copy either. *)
++                  let pre, capped =
++                    if fn.in_poll_error_function
++                    then pre, false
++                    else with_trip_cap ~dbg guard pre
++                  in
+                   report ~fn ~dbg
+-                    (Printf.sprintf "counted, %s%s"
++                    (Printf.sprintf "counted, %s%s%s"
+                        (match pre with
+                        | Always | Never -> "no entry check"
+                        | Check _ -> "entry check")
+@@ -2680,7 +2732,8 @@ let rec rewrite (config : config) int_vars expr =
+                        | [] -> ""
+                        | _ :: _ ->
+                          Printf.sprintf " (%d inner check(s) lifted)"
+-                           (List.length lifted)));
++                           (List.length lifted))
++                       (if capped then " (trip cap)" else ""));
+                   Some (original, handler, node, guard, pre)))
+           | _, _ :: _ :: _ ->
+             report ~fn
+diff --git a/driver/oxcaml_args.ml b/driver/oxcaml_args.ml
+index 3935db91c7..4cd314f8e2 100644
+--- a/driver/oxcaml_args.ml
++++ b/driver/oxcaml_args.ml
+@@ -246,6 +246,11 @@ let mk_dcmm_loops f =
+     Arg.Unit f,
+     " Print the Cmm of each function after the loop passes (-dcmm prints it before)" )
+ 
++let mk_cmm_counted_loops_max_trips f =
++  ( "-cmm-counted-loops-max-trips",
++    Arg.Int f,
++    "<n>  Make a counted loop poll-free only when it ends within about n iterations, checked on entry; otherwise run its polled copy (default 0: no limit)" )
++
+ let mk_cfg_stack_checks f =
+   ( "-cfg-stack-checks",
+     Arg.Unit f,
+@@ -1532,6 +1537,7 @@ module type Oxcaml_options = sig
+   val cmm_unchecked_loops : unit -> unit
+   val no_cmm_unchecked_loops : unit -> unit
+   val dcounted_loops : unit -> unit
++  val cmm_counted_loops_max_trips : int -> unit
+   val dcmm_loops : unit -> unit
+   val cmm_licm_polled : unit -> unit
+   val no_cmm_licm_polled : unit -> unit
+@@ -1765,6 +1771,7 @@ module Make_oxcaml_options (F : Oxcaml_options) = struct
+       mk_cmm_unchecked_loops F.cmm_unchecked_loops;
+       mk_no_cmm_unchecked_loops F.no_cmm_unchecked_loops;
+       mk_dcounted_loops F.dcounted_loops;
++      mk_cmm_counted_loops_max_trips F.cmm_counted_loops_max_trips;
+       mk_dcmm_loops F.dcmm_loops;
+       mk_cmm_licm_polled F.cmm_licm_polled;
+       mk_no_cmm_licm_polled F.no_cmm_licm_polled;
+@@ -2154,6 +2161,7 @@ module Oxcaml_options_impl = struct
+   let cmm_unchecked_loops = set' Oxcaml_flags.cmm_unchecked_loops
+   let no_cmm_unchecked_loops = clear' Oxcaml_flags.cmm_unchecked_loops
+   let dcounted_loops = set' Oxcaml_flags.dump_counted_loops
++  let cmm_counted_loops_max_trips n = Oxcaml_flags.cmm_counted_loops_max_trips := n
+   let dcmm_loops = set' Oxcaml_flags.dump_cmm_loops
+   let cmm_licm_polled = set' Oxcaml_flags.cmm_licm_polled
+   let no_cmm_licm_polled = clear' Oxcaml_flags.cmm_licm_polled
+@@ -2790,6 +2798,7 @@ module Extra_params = struct
+     | "cmm-licm" -> set' Oxcaml_flags.cmm_licm
+     | "cmm-counted-loops" -> set' Oxcaml_flags.cmm_counted_loops
+     | "cmm-unchecked-loops" -> set' Oxcaml_flags.cmm_unchecked_loops
++    | "cmm-counted-loops-max-trips" -> set_int' Oxcaml_flags.cmm_counted_loops_max_trips
+     | "cmm-licm-polled" -> set' Oxcaml_flags.cmm_licm_polled
+     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
+     | "cfg-eliminate-dead-trap-handlers" ->
+diff --git a/driver/oxcaml_args.mli b/driver/oxcaml_args.mli
+index d67eb15cea..4825809d52 100644
+--- a/driver/oxcaml_args.mli
++++ b/driver/oxcaml_args.mli
+@@ -66,6 +66,7 @@ module type Oxcaml_options = sig
+   val cmm_unchecked_loops : unit -> unit
+   val no_cmm_unchecked_loops : unit -> unit
+   val dcounted_loops : unit -> unit
++  val cmm_counted_loops_max_trips : int -> unit
+   val dcmm_loops : unit -> unit
+   val cmm_licm_polled : unit -> unit
+   val no_cmm_licm_polled : unit -> unit
+diff --git a/driver/oxcaml_flags.ml b/driver/oxcaml_flags.ml
+index a3d2432795..b193048794 100644
+--- a/driver/oxcaml_flags.ml
++++ b/driver/oxcaml_flags.ml
+@@ -62,6 +62,9 @@ let cmm_unchecked_loops = ref false     (* -[no-]cmm-unchecked-loops *)
+ 
+ let dump_counted_loops = ref false      (* -dcounted-loops *)
+ 
++(* A cap on the stop-the-world latency a counted loop can add: a loop that may run more than this many iterations runs its polled copy instead. 0 means no cap. *)
++let cmm_counted_loops_max_trips = ref 0  (* -cmm-counted-loops-max-trips *)
++
+ let dump_cmm_loops = ref false  (* -dcmm-loops *)
+ 
+ (* Loop-invariant code motion out of loops that may reach a safepoint, restricted to integer operands, which the collector never moves. See cmm_strength_reduction.ml. *)
+diff --git a/driver/oxcaml_flags.mli b/driver/oxcaml_flags.mli
+index 4c9a0a773c..ddfe191652 100644
+--- a/driver/oxcaml_flags.mli
++++ b/driver/oxcaml_flags.mli
+@@ -55,6 +55,8 @@ val cmm_unchecked_loops : bool ref
+ 
+ val dump_counted_loops : bool ref
+ 
++val cmm_counted_loops_max_trips : int ref
++
+ val dump_cmm_loops : bool ref
+ 
+ val cmm_licm_polled : bool ref
+-- 
+2.47.3
+

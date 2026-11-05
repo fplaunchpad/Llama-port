@@ -1,113 +1,196 @@
-# microgpt port benchmark — contract
+# Benchmark
 
-Five implementations of the same inference algorithm — Python, C++, Rust, OxCaml and plain
-OCaml — measured on **token generation speed** and **held-out perplexity**, loading
-**identical weights**.
+Part A says how to run the benchmark and what it measures. Part B is the contract every
+port implements, which is what makes all five produce bit-identical output.
 
-Any port that follows this document can be dropped into `bench/run.py` and compared.
+# Part A: running the benchmark
 
-The last two are the same OCaml source under two different compilers: `oxcaml` is built by
-Jane Street's OxCaml variant (flambda2 middle-end, `-O3`), `ocaml` by the stock upstream
-compiler (closure middle-end, where `-O3` does not exist). `impl/ocaml/build.sh` asserts the
-two sources have not drifted, so the gap between those two rows is the compiler and nothing
-else. See [OPTIMIZATIONS.md](OPTIMIZATIONS.md) for what that gap turns out to be.
-
-## Current results
-
-**The headline comparison is the uniform one:** all five implementations built with matched
-optimization levels and timed inside a single Linux environment (WSL Debian), pinned with
-`taskset`, 9 interleaved rounds. Reproduce with:
+## The command
 
 ```bash
-wsl -d Debian -- bash tools/bench_wsl.sh          # from the repo root
+python3 bench/bench.py              # every variant this machine can build
+bash tools/bench_variants.sh        # the same run, under the original script name
 ```
 
-### Generation
-
-| impl | runtime | tok/s (median) | vs Python | vs fastest |
-|---|---|---:|---:|---:|
-| cpp | g++ 14.2 `-O3` | 732,253 | **115x** | 100% |
-| rust | rustc 1.98.1 `--release` | 671,684 | **106x** | 92% |
-| oxcaml | ocamlopt 5.2.0+ox `-O3 -unsafe` (flambda2) | 407,168 | **64x** | 56% |
-| ocaml | ocamlopt 5.3.0 `-unsafe` (closure) | 402,971 | **64x** | 55% |
-| python | CPython 3.13.5 | 6,348 | 1.0x | 1% |
-
-### Perplexity throughput
-
-| impl | tok/s (median) | vs Python |
-|---|---:|---:|
-| cpp | 732,113 | 112x |
-| rust | 671,177 | 103x |
-| oxcaml | 407,068 | 63x |
-| ocaml | 391,495 | 60x |
-| python | 6,516 | 1.0x |
-
-Perplexity itself is **10.789614873329409** for all five, bit-identical, as is the generated
-text (`0xae6c6ffbd8f5b02c`) and `weights_sum`.
-
-Paired over 9 rounds: Rust −8.6% vs C++ on gen and −8.3% on ppl. OxCaml −44.7% / −44.2%,
-plain OCaml −44.7% / −46.2%. Within each implementation gen and ppl agree closely, which is
-the cross-check that the timing is sound — both run the same forward pass, so they must.
-
-The same picture on Windows for the three that run there natively (12 paired rounds,
-`python tools/track_opt.py`): C++ 883,446 tok/s, Rust 849,316, C++ ahead by 4.6% winning
-12/12. Absolute numbers differ between the two environments; the *ordering* agrees.
-
-**The two OCaml rows land on top of each other**, and that is the result, not a rounding
-artifact: paired per round, flambda2's lead on the shipped kernel is a few percent and it
-wins only 6 of 9 rounds — this run cannot separate it from noise. The same two compilers are
-2.1x apart on the *unoptimized* kernel — flambda2
-finds instruction-level parallelism in the plain dot-product loop that the closure backend
-does not — and hand-unrolling the kernel four ways hands that same parallelism to both,
-which is what collapses the gap. One caveat on the controlled variable: the two compilers
-are a language minor version apart (5.2.0+ox against 5.3.0), because that is what the OxCaml
-switch pins. The middle-end dominates, but it is not the only thing that differs.
-
-**Ranking note.** Rust led C++ until the 4-way `linear` unroll was applied to both: that
-change is worth ~+19% to C++ and only ~+5% to Rust, so C++ moved ahead. Every optimization
-is a build switch, so the whole ladder can be re-measured:
+Run it on a quiet machine (no compiles or other load; on a laptop, plugged in). It builds
+every variant into a temporary directory, checks that each one reproduces the reference
+output, then times them in interleaved rounds and prints, per concept, what each
+optimisation is worth. The repository is not modified. To keep the output:
 
 ```bash
-wsl -d Debian -- bash tools/bench_variants.sh     # from the repo root
+python3 bench/bench.py 2>&1 | tee matrix.txt
 ```
 
-That produces a `<language>_<optimization>` matrix — 19 variants, all bit-identical, ranging
-from 6,672 tok/s (`python`) to 827,692 (`cpp_unroll`). It shows plainly that **optimization
-effort, not language choice, decided the ranking**: unoptimized Rust beats C++ at `-O2` and
-at `-O3`, while fully optimized C++ leads by 11.3%. Both OCaml compilers get the full
-{`-unsafe`, bounds-checked} × {plain, unrolled} grid there, because those two switches
-interact, plus an `MG_SR=1` build that hand-applies the strength reduction flambda2 will not
-do; OxCaml also gets `_pollfree` builds that price its GC safepoint poll.
-See [OPTIMIZATIONS.md](OPTIMIZATIONS.md).
+Useful selections and knobs (the environment variables work for both commands):
 
-### Correctness is portable; speed is not
+```bash
+python3 bench/bench.py --set headline          # headline | ablation | control | all
+python3 bench/bench.py --concept counted,simd  # these concepts and what they are compared to
+python3 bench/bench.py --only cpp_novec,oxcaml_unsafe_unroll
+python3 bench/bench.py --build-only            # build and check output, no timing
+ROUNDS=3 BUDGET=0.2 python3 bench/bench.py     # quick smoke run; do not quote these numbers
+MODES="gen ppl" python3 bench/bench.py         # also time the perplexity path
+PIN=-1 python3 bench/bench.py                  # no CPU pinning
+python3 bench/bench.py --list                  # the registry, with every build command
+python3 bench/bench.py --show pr_counted       # how one variant is built
+```
 
-Verified here: the same C++ source under g++ 15.2 / Windows UCRT and g++ 14.2 / Linux glibc
-produces **bit-identical** output. So agreement can be chained across platforms — which is
-how the OxCaml port, which only builds for linux-x86_64, is confirmed identical to the
-others. Timing cannot be chained that way: comparing a Windows-native binary against a WSL one
-measures the OS and libm, not the language, which is why `tools/bench_wsl.sh` builds and
-times everything in one place.
+| knob | default | meaning |
+|---|---|---|
+| `ROUNDS` / `--rounds` | 9 | interleaved rounds; each measures every variant once |
+| `REPEATS` / `--repeats` | 3 | timed passes per measurement, in one fresh process; the best is kept |
+| `BUDGET` / `--budget` | 0.3 | seconds per timed pass |
+| `SAMPLES` / `--samples` | 200 | names generated per pass (the reference hash assumes 200) |
+| `MODES` / `--modes` | `gen` | `gen`, `ppl`, or `"gen ppl"` |
+| `PIN` / `--pin` | 0 | logical CPU for `taskset`; `-1` disables pinning |
+| `OUTDIR` / `--out` | `<tmp>/microgpt-bench` | binaries, build logs, `hashes.txt` and the raw `t_<mode>.txt` |
 
-Perplexity in context, all fit on the same 1,000 documents microgpt trained on
-(`python tools/baselines.py`):
+## Platforms and prerequisites
 
-| model | nll/token | perplexity |
-|---|---:|---:|
-| uniform over 27 tokens | 3.2958 | 27.00 |
-| unigram (char frequency) | 2.8332 | 17.00 |
-| bigram (count table) | 2.5120 | 12.33 |
-| **microgpt (1,000 steps)** | **2.3786** | **10.79** |
+Every toolchain is optional; a variant whose toolchain or compiler is missing is reported
+as `SKIPPED` or `FAILED` (with a build log) and the rest runs.
 
-Agreement is also verified across model shapes, not just this checkpoint
-(`python tools/test_shapes.py`): 1/2/3-layer, 8-embd to 32-embd, 1 to 8 heads, all matching
-exactly. The shipped checkpoint has `n_layer=1`, so without that sweep the transformer's
-per-layer indexing would never actually be exercised.
+| toolchain | variants |
+|---|---|
+| `python3` (required; also runs the harness) | `python` |
+| `g++` or clang as `g++` | `cpp_*` (`cpp_novec_avx` needs x86-64) |
+| `cargo` | `rust_*` |
+| a stock `ocamlopt` on `PATH`, or `MG_OCAML_SWITCH=<opam switch>` | `ocaml_*` |
+| OxCaml 5.4.0-ox7, opam package `oxcaml-compiler.5.4.0-ox7` (Linux x86-64; `MG_OX_RELEASE`) | `oxcaml_*` (the `_pollnop` builds also need `objdump`) |
+| opam switch `5.2.0+ox` (Linux x86-64) | `oxcaml52_*` |
+| the locally built compilers of [compiler-patches/](compiler-patches/README.md) | `ox54_*`, `pr_*` |
+| OCaml 5.3.0 with the passes ported (`MG_OCAML_PR`) | `ocaml_pr_*` |
 
-Measure in **short, isolated sessions**. A long benchmark run lets the machine lose clock
-across it, and numbers spread by 1.6x or more; `bench/run.py` warns when that happens.
+**Linux** is the reference platform; everything runs. **macOS**: C++, Rust, Python and
+stock OCaml run; OxCaml targets Linux x86-64, so the OxCaml variants are skipped (its build
+script refuses a non-OxCaml compiler rather than mislabelling a stock build). macOS has no
+`taskset`, so the run is unpinned: prefer the paired "rounds won" figures to absolute
+tokens/s. **Windows**: run inside WSL (`wsl -d Debian -- python3 bench/bench.py`), where
+the OCaml compilers live, so that every variant is timed in the same environment. From
+Git Bash, prefix `MSYS_NO_PATHCONV=1` so Unix paths reach WSL unchanged.
 
----
+## Reading the output
+
+1. **Correctness gate.** Every variant's output hash and perplexity. With the default
+   settings both must equal the reference, `0xae6c6ffbd8f5b02c` and `10.789614873329409`,
+   and the gate ends with `ALL IDENTICAL`. A variant that differs is not timed and the
+   command exits non-zero: a faster build with different output is a bug.
+2. **The table.** Median tokens/s per variant, its interquartile range across rounds, the
+   gap to scalar C++ (`cpp_novec` / variant) and the speed-up over Python.
+3. **Effects by concept.** Each comparison from `bench/variants.py`: the median per-round
+   change of the second build over the first, its interquartile range, and the rounds it
+   won. These paired figures are the ones to quote: a difference that wins 20 of 21
+   rounds is real, one that wins 11 is noise. Absolute tokens/s depend on the machine;
+   ratios and paired effects travel.
+
+Numbers from two invocations are not comparable (thermal and frequency state differ), so
+every figure quoted together should come from one run.
+
+## The variant registry
+
+[`bench/variants.py`](bench/variants.py) is the single definition of every build: name,
+group, concept, description and build recipe. The names are those of the report and of
+run W, in run W's measurement order. Groups:
+
+- **headline**: the reference builds and one build per optimisation step (25);
+- **ablation**: a headline build with one thing switched off or on, to price it (34);
+- **control**: builds that test the measurement rather than an optimisation (3).
+
+| concept | headline | ablation | control |
+|---|---|---|---|
+| ports and baselines | `python`, `cpp_unroll`, `cpp_novec`, `rust_unroll`, `ocaml_unsafe_unroll` | | |
+| `-unsafe` | `oxcaml_safe_plain`, `oxcaml_unsafe_plain` | `oxcaml_safe_unroll` | |
+| 4-row unrolled kernel | `oxcaml_unsafe_unroll` | `cpp_plain`, `rust_plain` | |
+| flambda2 against closure (same source) | | `ocaml_safe_plain`, `ocaml_safe_unroll`, `ocaml_unsafe_plain` | |
+| strength reduction by hand (`MG_SR=1`) | `oxcaml_unsafe_sr` | `oxcaml_unsafe_sr_pollfree`, `ocaml_unsafe_sr` | |
+| safepoint polls, release compiler | | `oxcaml_unsafe_{plain,unroll}_pollnop`, `oxcaml_unsafe_{plain,unroll}_pollfree` | |
+| compiler pass: strength reduction | `ox54_base`, `ox54_sr` | | |
+| compiler pass: interior pointers | `ox54_ip` | `ox54_ip_off` | |
+| compiler pass: invariant strides | `ox54_ivs` | `ox54_ivs_noptr` | |
+| compiler pass: LICM | `ox54_licm` | | |
+| passes with safepoints on | `pr_off`, `pr_all` | `pr_off_nopoll`, `pr_nopoll` | |
+| counted and unchecked loops | `pr_counted` | `pr_counted_noptr`, `pr_unchecked`, `pr_safe_counted` | |
+| explicit SIMD (`MG_SIMD=1`) | `oxcaml_unsafe_simd`, `pr_simd` | `pr_simd_off`, `pr_simd_counted`, `pr_simd_nopoll` | |
+| the pass ladder with counted loops | `pr_c_off`, `pr_c_sr`, `pr_c_ip`, `pr_c_ivs` | | |
+| the passes on stock OCaml 5.3.0 | `ocaml_pr_all`, `ocaml_pr_counted` | `ocaml_pr_off` | |
+| release upgrade, 5.2.0+ox to 5.4.0-ox7 | | every `oxcaml52_*` | |
+| measurement controls | | | `cpp_O2_plain`, `cpp_novec_avx`, `pr_counted_copy` |
+
+Name parts: language (`cpp`, `rust`, `ocaml` stock (`ocaml_pr` with the ported passes), `oxcaml` 5.4.0-ox7 release,
+`oxcaml52` 5.2.0+ox release, `ox54`
+ladder compilers built without polls, `pr` pull-request compiler with polls), then safety
+(`safe` keeps bounds checks, `unsafe` uses `-unsafe`), kernel (`plain` or 4-row `unroll`)
+and modifiers (`_sr` hand strength reduction, `_simd` SSE2 kernel, `_pollfree`
+`-disable-poll-insertion`, `_pollnop` polls overwritten in the binary, `_nopoll` the same
+flag on the PR compiler, `_off` passes off, `_c_` counted loops with the passes added one at a time, `_noptr` no interior or carried pointers).
+`python3 bench/bench.py --list` prints every row with its build command. No variant has
+been renamed; `ALIASES` in `bench/variants.py` is where an old name would map to a new one.
+
+## Reproducing run W
+
+Run W is the run behind every microgpt number in the report: 62 variants, 21 rounds, both
+modes, pinned to CPU 0, in WSL Debian on an Intel Core Ultra 7 155H, with g++ 14.2,
+rustc 1.98.1, stock OCaml 5.3.0 and a copy with the passes ported, OxCaml 5.4.0-ox7 and
+5.2.0+ox, the ladder and pull-request compilers of
+[compiler-patches/](compiler-patches/README.md) and CPython 3.13.5. The same run:
+
+```bash
+SETTLE=300 OUTDIR=/tmp/mgw python3 bench/bench.py --set all --rounds 21 --modes "gen ppl"
+```
+
+Its raw output, `/tmp/mgw/t_gen.txt` and `t_ppl.txt`, has the format of
+`report/data/run_w_gen.txt` and `run_w_ppl.txt`; copying them there and following
+`report/data/README.md` refreshes every number and figure in the report. To see run W's
+effects without timing anything:
+
+```bash
+python3 bench/bench.py --summarise report/data/run_w_gen.txt report/data/run_w_ppl.txt
+```
+
+`bench/bench.py` runs the report's protocol (output gate with
+`--mode all --repeats 1 --time-budget 0.05`; then per round and variant one fresh process,
+`taskset -c 0`, `--repeats 3 --time-budget 0.3`, 200 samples, seed 1234, temperature 0.5).
+One difference: a variant whose output differs is excluded from timing instead of being
+flagged. The region profiles of report Figure 6 come from
+
+```bash
+python3 tools/profile_regions.py --rounds 7 --impls cpp,cpp_novec,oxcaml,ox54_ivs,ox54_ip,pr_counted
+```
+
+## The protocol, and why
+
+Each rule addresses an effect of 1.5x to 3x on a hybrid laptop CPU, larger than most of
+the differences being measured.
+
+**Equal time, not equal work.** A process's throughput depends on how long it has been
+running (the same forward pass measured 3,449 tokens/s in a 0.7 s workload and 1,601 in a
+23 s one), so every measurement runs for the same `--time-budget` and reports a rate.
+
+**Pinning.** A scheduler can move sustained single-threaded work to an efficiency core,
+2-3x slower for scalar floating point. `taskset -c 0` keeps it on a performance core.
+
+**One process per measurement.** Generation and perplexity run in separate processes:
+in one process, whichever runs second is slower in every language.
+
+**Best of N, interleaved rounds, paired deltas.** Interference only ever slows a run, so
+the fastest repeat is kept. Each round measures every variant once, so slow drift affects
+all of them alike, and an optimisation's effect is its median per-round change against the
+build it modifies. Run W's A/A control (two byte-identical binaries) bounds the resolution
+at about 3%.
+
+**Cross-check.** Generation and perplexity run the same forward pass, so their throughputs
+must agree within a variant; when they do not, the measurement is at fault.
+
+This model is tiny (4,192 weights, all in L1), so the benchmark measures per-operation
+overhead, not memory bandwidth. The format, contract and harness are shape-agnostic: a
+wider model (`tools/train_export.py --n-embd 64 --n-layer 4`) runs unchanged.
+
+# Part B: the contract
+
+Five implementations of the same inference algorithm, measured on **token generation
+speed** and **held-out perplexity**, loading **identical weights**. A port that follows
+this contract can be added to `bench/run.py` and `bench/variants.py`; see
+[PORTING.md](PORTING.md) for what goes wrong in practice.
 
 ## 1. There are no pretrained weights to download
 
@@ -116,7 +199,7 @@ random init plus 1,000 Adam steps, and its architecture is bespoke (1 layer, `n_
 `block_size=16`, 4 heads, vocab 27, rmsnorm instead of layernorm, no biases, ReLU instead of
 GeLU). No checkpoint for it exists publicly, and no unrelated checkpoint is shape-compatible.
 
-This costs nothing, because training is a **one-time ~80 second** job:
+Training is a **one-time, deterministic, ~80 second** job:
 
 ```bash
 python tools/train_export.py --steps 1000
@@ -124,15 +207,13 @@ python tools/train_export.py --steps 1000
 
 `tools/train_export.py` is a faithful copy of microgpt.py's math, RNG call order and
 optimizer, so it produces exactly the weights microgpt.py would hold when its own training
-loop ends. It then writes `weights/microgpt.bin`. **After that nothing ever trains again** —
-all five implementations are inference-only and just read that file.
+loop ends, and writes them to `weights/microgpt.bin`. All five implementations are
+inference-only and read that file.
 
-Current checkpoint: 1,000 steps, train loss 3.37 → 2.32, held-out perplexity 10.79
-(uniform baseline is 27.0).
+Checkpoint: 1,000 steps, train loss 3.37 -> 2.32, held-out perplexity 10.79 (uniform
+baseline 27.0, unigram 17.00, bigram 12.33; `python tools/baselines.py`).
 
----
-
-## 2. Weight file format — `microgpt-bin-v1`
+## 2. Weight file format: `microgpt-bin-v1`
 
 Little-endian throughout. `weights/config.json` mirrors all of this in readable form,
 including a sha256 and checksums for load verification.
@@ -154,7 +235,7 @@ including a sha256 and checksums for load verification.
 `bos_token_id == n_uchars` (there is no character for it), and `vocab_size == n_uchars + 1`.
 `head_dim == n_embd / n_head`.
 
-Tensor order — read them back-to-back in exactly this sequence, with `E = n_embd`,
+Tensor order: read them back-to-back in exactly this sequence, with `E = n_embd`,
 `V = vocab_size`, `B = block_size`:
 
 1. `wte` `[V][E]`
@@ -170,12 +251,10 @@ With the defaults that is 4,192 f64 values = 33,536 payload bytes, 33,600 total.
 `weights_sum` / `weights_abs_sum` in `config.json`. A port that gets these wrong has a
 layout bug, and everything downstream is meaningless.
 
----
-
 ## 3. Numerics contract
 
-All five implementations compute in **f64** and must apply operations in the same order, so
-that perplexity agrees to ~1e-12 rather than merely "close enough". Reproduce these exactly:
+All implementations compute in **f64** and apply operations in the same order, so that
+perplexity agrees to the last digit rather than merely "close enough":
 
 ```
 linear(x, W)[o]  = accumulate acc = 0.0; for i in 0..nin: acc += W[o][i] * x[i]
@@ -195,7 +274,7 @@ attention        = logits[t] = (accumulate q_h[j]*k_h[t][j], ascending j) / pow(
                    out[j]    = accumulate weights[t]*v_h[t][j], ascending t
 
 relu(x)          = x > 0.0 ? x : 0.0
-                   (write it this way round. `if x <= 0 { x = 0 }` looks equivalent but
+                   (written this way round: `if x <= 0 { x = 0 }` looks equivalent but
                     leaves NaN untouched, where this maps NaN to 0.0)
 temperature      = z[i] / temperature        // divide; do NOT precompute 1/temperature
 ```
@@ -216,32 +295,27 @@ for each layer:
 logits = linear(x, lm_head)
 ```
 
-**Beware your language's `sum()`.** "Plain sequential accumulation" above is a real
-constraint, not boilerplate. CPython has used Neumaier *compensated* summation for floats
-since 3.12, so `sum(w*x for ...)` is measurably more accurate than a running total - on this
-checkpoint it changed **141 of 214** dot products and shifted `weights_sum` by 5e-15. That is
-not something C++ or Rust reproduce, so the Python reference uses explicit `acc += ...` loops
-instead. Rust's `iter().sum::<f64>()` is a plain fold and is fine; `f64::mul_add` is not, as
-it fuses. If a port's `weights_sum` does not match `config.json` **exactly**, this is the
-first thing to suspect - `bench/run.py` now compares it exactly for that reason.
+The 4-row unrolled kernels compute four output rows at once, each still summed in
+ascending order, and the SSE2 kernel puts rows, not elements, in vector lanes; both are
+the same arithmetic as `linear` above.
 
-**Compiler flags: no fast-math, and match the optimization level across languages.**
-`-ffast-math` / `-Ofast` reassociate sums and break cross-language agreement. Build C++ with
-`-O3 -fno-fast-math -ffp-contract=off`, and Rust with plain `--release` (no `-C
-target-feature` fiddling that enables FMA contraction).
+**Beware your language's `sum()`.** "Plain sequential accumulation" is a real constraint.
+CPython has used Neumaier *compensated* summation for floats since 3.12, so
+`sum(w*x for ...)` is more accurate than a running total: on this checkpoint it changes
+**141 of 214** dot products and shifts `weights_sum` by 5e-15. The Python reference
+therefore uses explicit `acc += ...` loops. Rust's `iter().sum::<f64>()` is a plain fold
+and is fine; `f64::mul_add` is not, as it fuses. If a port's `weights_sum` does not match
+`config.json` **exactly**, this is the first thing to suspect.
 
-`-O3` rather than `-O2` specifically because Rust's release profile is `opt-level = 3`.
-Benchmarking `g++ -O2` against Rust `opt-level 3` measures the flag, not the language: it
-cost C++ about 20% here (472k vs 587k tok/s) and made Rust look ~20% faster than C++ when
-the two are actually neck and neck.
+**Compiler flags: no fast-math, and matched optimisation levels.** `-ffast-math` /
+`-Ofast` reassociate sums and break cross-language agreement. C++ is built with
+`-O3 -fno-fast-math -ffp-contract=off`, Rust with plain `--release`. `-O3` rather than
+`-O2` because Rust's release profile is `opt-level = 3`; in run W `-O3` is worth +15.3%
+to C++ (`cpp_O2_plain` -> `cpp_plain`), so comparing `-O2` C++ with Rust measures the flag.
 
-Residual differences of ~1e-15 per logit are tolerated, since libm `exp`/`log`/`pow` may
-differ between implementations by an ulp - though in practice CPython and MSYS2 UCRT agree
-exactly here, and Python and C++ currently produce bit-identical perplexity. `tools/validate.py` demonstrates the accepted
-noise floor by checking the Python reference against microgpt.py's own autograd graph
-(measured: 1.3e-13 max relative logit difference, identical NLL to 15 digits).
-
----
+`tools/validate.py` checks the Python reference against microgpt.py's own autograd graph:
+1.3e-13 largest relative logit difference (microgpt.py divides through a reciprocal), and
+identical NLL to 15 digits.
 
 ## 4. RNG and sampling
 
@@ -263,10 +337,10 @@ next_f64():
     return (next_u64() >> 11) * (1.0 / 9007199254740992.0)   // 2^-53, in [0,1)
 ```
 
-Rust: use `wrapping_shl`-free `<<` on `u64` in release is fine, but write
-`wrapping_mul` for the multiply. C++: `uint64_t` arithmetic already wraps.
+Rust: `<<` on `u64` is fine, but write `wrapping_mul` for the multiply. C++: `uint64_t`
+arithmetic already wraps.
 
-Sanity vector — seed `1234`, first four `next_u64()` draws are reported in every
+Sanity vector: seed `1234`; the first four `next_u64()` draws are reported in every
 implementation's `check` output and must match.
 
 Sampling from a probability vector:
@@ -279,17 +353,15 @@ sample(probs, rng):
     return n - 1
 ```
 
----
-
 ## 5. Tokenization and the two measurements
 
 **Tokenizer.** A document is `[BOS] + one token per character + [BOS]`, matching how
-microgpt.py trains. Character token id is its index in the vocab string.
+microgpt.py trains. A character's token id is its index in the vocab string.
 
 ### Perplexity (`--mode ppl`)
 
-Teacher-forced over `data/val.txt` — 2,000 documents the model never saw, since training
-only ever consumed `docs[:1000]`. No temperature, no sampling.
+Teacher-forced over `data/val.txt`: 2,000 documents the model never saw, since training
+only consumed `docs[:1000]`. No temperature, no sampling.
 
 ```
 for each doc:
@@ -304,8 +376,7 @@ perplexity = exp(nll / count)
 ```
 
 The `min(block_size, …)` cap is microgpt.py's; with a 15-character longest name it never
-actually truncates, so every token of every document is scored. Expect
-`docs=2000, tokens=14307`.
+truncates, so every token of every document is scored: `docs=2000, tokens=14307`.
 
 ### Generation speed (`--mode gen`)
 
@@ -321,10 +392,8 @@ for each of --samples samples:
 ```
 
 The RNG is **re-seeded at the start of every repeat**, so all repeats do identical work and
-produce identical text. `tokens_generated` counts forward passes — that is the numerator for
-tokens/sec.
-
-Defaults: `--samples 1000 --temperature 0.5 --seed 1234 --repeats 5`.
+produce identical text. `tokens_generated` counts forward passes; it is the numerator for
+tokens/s.
 
 Each implementation runs this in two parts:
 
@@ -333,50 +402,12 @@ Each implementation runs this in two parts:
 2. `--repeats` **timed passes**, each generating until `--time-budget` seconds have elapsed.
 
 Perplexity works the same way: one full pass over the evaluation set for the number itself,
-then time-budgeted passes cycling the corpus for the throughput measurement.
-
-### Timing methodology, and why it is this convoluted
-
-Wall clock around the loop only; weight loading is reported separately as `load_seconds` and
-excluded. Three measures exist because measuring this naively produced numbers that were
-wrong by more than 2x on the development machine:
-
-**Equal time, not equal work.** A fixed workload means Python runs for 20 seconds while C++
-runs for 40 milliseconds — and a process's throughput on a modern laptop depends on how long
-it has been running. Measured here: the identical forward pass ran at 3,449 tok/s in a 0.7s
-workload and 1,601 tok/s in a 23s workload. Comparing those directly measures CPU clock
-behaviour, not language performance. Every implementation therefore runs for the same
-`--time-budget` per repeat, and throughput is reported as a **rate**.
-
-**CPU pinning (`--pin`, default logical CPU 0).** On hybrid CPUs (Intel P-core/E-core, and
-ARM big.LITTLE) the scheduler migrates sustained single-threaded work onto an efficiency
-core, which is 2-3x slower for scalar FP. P-cores enumerate first, so CPU 0 is a P-core in
-practice. Pass `--pin -1` to disable.
-
-**One process per measurement.** `bench/run.py` invokes each implementation separately for
-`gen` and for `ppl` rather than once with `--mode all`. Running them back to back in one
-process made whichever went second look ~1.5x slower in *both* languages, because by then the
-process had been busy for ~10 seconds and had lost clock. Splitting the processes dropped
-measured spread from ~1.6x to ~1.03x and brought gen and ppl into agreement.
-
-**Best of N repeats.** Contamination only ever makes a run slower, so the fastest repeat is
-the least-contaminated estimate. The harness also reports **spread** — fastest/slowest repeat
-*rate* — and warns above 1.25x. Compare rates rather than durations here: with a time budget
-every repeat takes the same number of seconds by construction, so it is the token count that
-varies.
-
-**Read the ratios with the spread in mind.** With all three measures in place the
-development machine (Core Ultra 7 155H, mobile, hybrid) reaches ~1.03x spread and a stable
-~142x. The cross-check that the numbers are sound is that the **gen and ppl throughputs agree
-within an implementation** — they measure the same forward pass, so they must. Two successive
-versions of this harness reported 211x/124x and then 159x/146x for those two; both
-disagreements were measurement bugs, and chasing them is what produced the rules above.
-
----
+then time-budgeted passes cycling the corpus for the throughput measurement. Wall clock
+covers the loop only; weight loading is reported separately as `load_seconds`.
 
 ## 6. CLI contract
 
-Every implementation accepts the same flags, so `bench/run.py` can drive them uniformly:
+Every implementation accepts the same flags, so the harnesses can drive them uniformly:
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -389,19 +420,16 @@ Every implementation accepts the same flags, so `bench/run.py` can drive them un
 | `--repeats N` | `5` | timed repeats |
 | `--time-budget F` | `2.0` | wall-clock seconds per timed repeat |
 | `--pin N` | `0` | pin to this logical CPU (`-1` disables) |
-
-`--pin` is accepted by every implementation, but a port whose language has no affinity
-binding may report `"cpu_pin": "external (taskset)"` and rely on being pinned from outside
-instead. Both OCaml ports do this, since OCaml's stdlib exposes no `sched_setaffinity`;
-`tools/bench_wsl.sh` and `tools/bench_variants.sh` pass `--pin -1` and use `taskset` for
-every implementation, so all of them get identical treatment.
 | `--max-docs N` | `0` (all) | truncate the perplexity set |
-| `--json PATH` | — | also write the report to this file |
+| `--json PATH` | | also write the report to this file |
+
+A port whose language has no affinity binding may report `"cpu_pin": "external (taskset)"`
+and rely on being pinned from outside; both OCaml ports do, since OCaml's stdlib exposes
+no `sched_setaffinity`. `bench/bench.py` passes `--pin -1` and pins every implementation
+with `taskset`, so all of them get identical treatment.
 
 The JSON report goes to stdout. Nothing else may be printed to stdout; diagnostics go to
 stderr.
-
----
 
 ## 7. JSON report contract
 
@@ -449,65 +477,46 @@ h = 0xCBF29CE484222325
 for each byte b: h ^= b; h = h * 0x100000001B3   // wrapping
 ```
 
----
-
 ## 8. What counts as a correct port
 
-`bench/run.py` enforces, across every implementation:
-
-`gen.tokens`, `gen.output_fnv1a64` and `ppl.tokens` all come from the deterministic passes,
-never from the time-budgeted ones, so they stay comparable across implementations.
-
-`check.first3_nll` must group its summation per document and then add, the same way the
-perplexity path does - all five implementations route it through their `score_doc` helper
-for exactly this reason. Folding every token into one running total is a different summation
-order and shifts the last digits, which reads as a cross-language mismatch when it is only
-the fingerprint disagreeing with itself.
+Across every implementation:
 
 - identical `weights_sha256` and `config`
 - `weights_sum` / `weights_abs_sum` matching `config.json`
-- `check.rng_first4_u64` identical — proves the RNG is right
-- `ppl.perplexity` agreeing within **1e-9** relative
-- `gen.output_fnv1a64` identical — proves the ports generate the same text
+- `check.rng_first4_u64` identical: the RNG is right
+- `ppl.perplexity` agreeing within **1e-9** relative (in practice: to the last digit)
+- `gen.output_fnv1a64` identical: the ports generate the same text
 
 The hash is the strong check: it can only match if the forward pass, the softmax, the
-temperature division, the RNG and the sampling scan all agree. If perplexity matches but the
-hash does not, the divergence is in sampling, not the model.
+temperature division, the RNG and the sampling scan all agree. If perplexity matches but
+the hash does not, the divergence is in sampling, not the model.
 
-Note that the hash covers the whole generated corpus, so it changes with `--samples`,
-`--temperature` and `--seed`. It is only meaningful when comparing implementations **within a
-single `bench/run.py` invocation**, which is why the harness passes identical flags to every
-implementation. Do not compare a hash against one recorded from a different settings run.
+`gen.tokens`, `gen.output_fnv1a64` and `ppl.tokens` come from the deterministic passes,
+never from the time-budgeted ones, so they stay comparable. `check.first3_nll` groups its
+summation per document and then adds, as the perplexity path does: all five
+implementations route it through their `score_doc` helper, because one running total over
+every token is a different summation order.
 
----
+The hash covers the whole generated corpus, so it changes with `--samples`,
+`--temperature` and `--seed`; compare it only at identical settings. At the benchmark's
+settings (200 samples, temperature 0.5, seed 1234) it is `0xae6c6ffbd8f5b02c`; PORTING.md
+lists the values at the CLI defaults.
 
-## 9. Running it
+## 9. The cross-platform check harness
+
+`bench/run.py` builds the five shipped ports with whatever toolchains are present and
+checks the agreement rules above; it also runs natively on Windows (the OCaml ports
+through WSL, for agreement only):
 
 ```bash
 python tools/train_export.py --steps 1000     # once, ~80s, produces the weights
 python tools/validate.py                      # plain-float forward vs microgpt.py autograd
-python bench/run.py --build                   # build every port, run all, print the table
-```
-
-Useful variations:
-
-```bash
+python bench/run.py --build --check-only      # build every port, check agreement
 python bench/run.py --impls python,cpp --repeats 9 --time-budget 1.0
-python bench/run.py --impls ocaml,oxcaml      # the two compilers, same source
-python bench/run.py --check-only              # correctness agreement, no timing
-python bench/run.py --pin -1                  # disable CPU pinning
 ```
 
-Both OCaml ports are built by their own `build.sh`, which `--build` invokes (through
-`wsl.exe` on Windows, since the OxCaml compiler targets linux-x86-64 and the stock one is
-kept beside it so the two are comparable). They are checked for agreement on Windows but
-left out of the speed table there, because timing a WSL binary against Windows-native ones
-measures the OS. `tools/bench_wsl.sh` is where their numbers come from.
-
-Benchmark hygiene: close other heavy processes, keep the machine on AC power, and prefer the
-`_best` numbers. If `spread` stays above ~1.25x, the ratios are indicative rather than
-precise - see the timing methodology in section 5. This model is tiny (4,192 weights, everything in L1), so the comparison
-measures **language and interpreter overhead per scalar op**, not memory bandwidth or SIMD
-throughput. That is the honest framing of the result. For a version that stresses SIMD and
-cache instead, retrain wider — `--n-embd 64 --n-layer 4` — and rerun; the format, contract
-and harness are all shape-agnostic.
+Its timings are a quick look; the measured numbers come from `bench/bench.py`, which times
+everything in one Linux environment, because a Windows-native binary timed against a
+Linux one measures the operating system and libm as well as the language. Correctness is
+portable: the same C++ source under g++ 15.2 / Windows UCRT and g++ 14.2 / Linux glibc
+produces bit-identical output.

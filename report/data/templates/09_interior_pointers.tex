@@ -1,0 +1,95 @@
+\section{Stage V: Interior Pointers}
+\label{sec:ip}
+
+\subsection{The Idea}
+After strength reduction the loop still increments four indices; C++
+increments one offset shared by four row pointers. My guide proposed a way to
+close the difference: \emph{show that the hot loop does not
+allocate, and if GC polls are disabled, interior pointers are allowed inside
+that block.} A loop with no allocation, call or poll contains no safepoint, so
+a derived pointer created before it and dead after it is never seen by the
+collector.
+
+\subsection{Permission versus Transformation}
+Pointers into OCaml's Bigarrays, which live outside the heap, are already
+legal: the \emph{permission} is granted. Yet a Bigarray kernel compiled to 19
+instructions per 4 MACs instead of 18, reloading the data pointer every
+iteration: the \emph{transformation} was missing regardless. I therefore made
+the compiler form interior pointers into ordinary OCaml arrays.
+
+Polls are inserted long after Cmm, but a loop that neither allocates nor calls
+gets a back-edge poll unless poll insertion is disabled, so the condition
+reduces to two checks available on Cmm: the loop body is \emph{GC-free}, and
+polls are disabled. Counted loops (Section~\ref{sec:counted}) later replace
+the second check.
+
+\subsection{Design}
+\label{sec:ip-design}
+The pass extends the strength-reduction pass. For a recursive \code{catch}:
+
+\begin{enumerate}
+  \item \textbf{GC-freedom.} \code{is_gc_free} rejects a loop body containing
+        any call, allocation, poll, probe, region operation, atomic, or integer
+        division (whose zero-divisor path is a call). The match over Cmm
+        operations is exhaustive, so a new operation becomes a compile error.
+        Raising is allowed: the raise records an empty live set.
+  \item \textbf{Re-association and hoisting.} An access \code{a.(b + i)}
+        reaches Cmm as \code{(+a (+a a (<< (+ b i) 2)) -8)} with
+        $i = m\cdot c + k$. Shifts distribute over wrapping addition, so this
+        equals \code{(+a (+a (+a a (<< b 2)) (<< c 3)) -4)}; \code{a + 4b} is
+        bound once before the loop as an \code{Addr} and the access becomes
+        \code{disp(base, counter, 8)}. Four rows share one index register and
+        one increment, and the untagged counter removes the re-tag of
+        Section~\ref{sec:sr-pass}.
+  \item \textbf{Safety net.} If the analysis were wrong, an \code{Addr} live at
+        a safepoint would stop compilation with \code{bad GC root}, never
+        corrupt the heap.
+\end{enumerate}
+
+Interior pointers run before strength reduction on each loop and subsume it on
+the accesses they rewrite; with \code{-no-cmm-interior-pointers} the output is
+byte-identical to the strength-reduction compiler.
+
+\subsection{Verification}
+Of three small loops (clean, calling a closure, allocating) only the clean
+one was transformed (10 to 6 instructions). With \code{is_gc_free} stubbed to
+return \code{true}, the other two failed with
+\ainl|Fatal error: bad GC root ip_base:A/46[%rdi]|: the backend check catches
+any derived pointer live at a safepoint. It does not check the address
+arithmetic itself or the termination proof of Section~\ref{sec:counted}; the
+test suite, adversarial loops and GC stress tests cover those.
+
+\subsection{Results}
+\begin{lstlisting}[language=asmX,caption={Inner loop with strength reduction and interior pointers (no polls): 13 instructions per 4 MACs. The final compiler with counted loops emits the same loop with polls on.},label=lst:ip-loop]
+# preheader: four hoisted row bases (Addr), formed once
+leaq    (%rbx,%r13,4), %r13
+leaq    (%rbx,%r12,4), %r12
+leaq    (%rbx,%r9,4),  %r9
+leaq    (%rbx,%r8,4),  %r8
+.L168:
+vmovsd  (%rax,%r11,8), %xmm4             # x.(i), untagged counter
+vmulsd  -4(%r8,%r11,8), %xmm4, %xmm5     # row 0: base + shared index
+vaddsd  %xmm5, %xmm3, %xmm3
+vmulsd  -4(%r9,%r11,8), %xmm4, %xmm5     # row 1: same index register
+vaddsd  %xmm5, %xmm2, %xmm2
+vmulsd  -4(%r12,%r11,8), %xmm4, %xmm5
+vaddsd  %xmm5, %xmm1, %xmm1
+vmulsd  -4(%r13,%r11,8), %xmm4, %xmm4
+vaddsd  %xmm4, %xmm0, %xmm0
+incq    %r11                             # ONE increment for all four rows
+cmpq    %rbp, %r11
+jg      .Lexit
+jmp     .L168
+\end{lstlisting}
+
+The hot block went from 18 to 13 instructions (Listing~\ref{lst:ip-loop}).
+On the final compiler with counted loops, interior pointers are worth
+@P{pr_c_sr,pr_c_ip}@ on top of strength reduction, leaving OxCaml
+@G{pr_c_ip}@ behind scalar C++ (on the compilers built without polls,
+@P{ox54_ip_off,ox54_ip}@), with identical output. The loop
+executes fewer instructions per MAC than C++'s (13 against 15), yet the
+\code{linear} regions still run $1.21$--$1.29\times$ slower
+(Figure~\ref{fig:regions}(b)): instruction count had stopped being the
+explanation. Interior pointers form only in loops without polls; on the
+compilers of this stage that is every GC-free loop (Section~\ref{sec:reality}
+measures the release configuration).

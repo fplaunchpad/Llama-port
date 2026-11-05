@@ -1,0 +1,88 @@
+From e79a618bd435c953ed92204eee046f10ea0b19ad Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:29 +0000
+Subject: [PATCH 14/24] 06-strength-reduction-skips-sums-formed-by-lea
+
+---
+ backend/cmm_strength_reduction.ml | 56 ++++++++++++++++++++++++++++++-
+ 1 file changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index a2260dcfb4..ff744531d3 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -340,6 +340,58 @@ let sum_candidates ~affines expr =
+   loop expr;
+   List.rev !acc
+ 
++(* Where a sum [b + i] is used decides what carrying it saves. Carrying it
++   replaces the addition by a register copy, and adds one addition per
++   iteration on the back edge. That pays where the sum itself has to be
++   materialised: on its own, or as the index of an address, where [base +
++   scale * (b + i) + disp] has one register too many for an addressing mode.
++   It does not pay where the sum is offset by a constant anywhere else: there
++   the backend forms [b + i + c] with one [lea] from [b] and [i], exactly as it
++   forms [s + c] from the carried [s], so carrying it only adds the back-edge
++   addition and a live register. (A tagged index is such a sum: [a + i] on two
++   tagged integers is [(a + i) - 1] in [Cmm].)
++
++   The pairs returned are the sums used at least once where carrying them pays.
++   [Address] is the position of the index of an address. *)
++type sum_position =
++  | Address
++  | Value
++
++let sums_worth_carrying ~affines expr =
++  let acc = ref [] in
++  let keep pair =
++    if not (List.exists (same_pair pair) !acc) then acc := pair :: !acc
++  in
++  let offset_sum (expr : expression) =
++    match expr with
++    | Cop ((Caddi | Csubi), [inner; Cconst_int _], _)
++    | Cop (Caddi, [Cconst_int _; inner], _) ->
++      sum_with ~affines inner
++    | _ -> None
++  in
++  let rec walk position (expr : expression) =
++    match sum_with ~affines expr, offset_sum expr with
++    | Some pair, _ -> keep pair
++    | None, Some pair -> (
++      match position with Address -> keep pair | Value -> ())
++    | None, None -> (
++      match expr, position with
++      | Cop (Cadda, [base; index], _), _ ->
++        walk Value base;
++        walk Address index
++      | Cop (Clsl, [inner; Cconst_int (shift, _)], _), Address
++        when shift >= 0 && shift <= 3 ->
++        walk Address inner
++      | Cop (Cmuli, [inner; Cconst_int (n, _)], _), Address
++        when n = 1 || n = 2 || n = 4 || n = 8 ->
++        walk Address inner
++      | Cop ((Caddi | Csubi), [inner; Cconst_int _], _), Address ->
++        walk Address inner
++      | _ -> iter_subexpressions (walk Value) expr)
++  in
++  walk Value expr;
++  !acc
++
+ let rec replace_sum ~affines ~pair ~derived expr =
+   match sum_with ~affines expr with
+   | Some found when same_pair found pair -> Cvar derived
+@@ -486,9 +538,11 @@ let reduce ~duplicated ~int_vars ~label ~expr =
+   let usable invariant =
+     (not (V.Set.mem invariant bound_inside)) && V.Set.mem invariant int_vars
+   in
++  let worth = sums_worth_carrying ~affines handler.body in
+   let candidates =
+     List.filter
+-      (fun (invariant, _) -> usable invariant)
++      (fun ((invariant, _) as pair) ->
++        usable invariant && List.exists (same_pair pair) worth)
+       (sum_candidates ~affines handler.body)
+   in
+   let carried_already =
+-- 
+2.47.3
+

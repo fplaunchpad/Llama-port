@@ -1,0 +1,178 @@
+\section{Stage VI: The Outer Loop and a Register-Bound Kernel}
+\label{sec:stage6}
+
+\subsection{Invariant-Stride Induction Variables}
+\label{sec:ivs}
+With the inner loops nearly identical to C++, the difference moved to the
+\emph{row-group} loop. GCC advances four row pointers with four \code{addq}s
+per group; OxCaml rebuilt them with an \code{imulq} and eight \code{leaq}s.
+The row base \code{o * cols} steps by \code{4 * cols}, an invariant but not
+constant stride, which strength reduction declines:
+
+\begin{lstlisting}[language=CmmX,caption={The row bases in Cmm (tagged arithmetic).},label=lst:rowbases,numbers=none]
+b0 = (+ (* (+ o -1) (>>s cols 1)) 1)    ; a product with a runtime stride
+b1 = (+ (+ b0 cols) -1)
+b2 = (+ (+ b0 (<< cols 1)) -2)
+b3 = (+ (+ b0 (* cols 3)) -3)
+\end{lstlisting}
+
+The invariant-stride pass generalises the affine model to
+\code{pointer + (stride * counter + offset)}, with stride and offset
+\emph{expressions} over variables bound outside the loop. The stride is
+computed once and each back edge becomes one pointer addition; since the pass
+carries the four interior \emph{pointers}, the \code{imulq}/\code{leaq} chain
+becomes dead. Instruction selection now allows an \code{Addr} in a
+loop-carried register under the pass's condition; the \code{bad GC root}
+check still applies. The preamble fell from 25 to 13 instructions, the shape
+GCC emits. Carrying the indices
+instead (\code{-no-cmm-carried-pointers}) keeps nine values live instead of
+four and spills in the hot loop: on the compilers built without polls,
+carrying pointers is @P{ox54_ivs_noptr,ox54_ivs}@ faster, and the pass is
+worth @P{ox54_ip,ox54_ivs}@ over interior pointers alone.
+
+\subsection{Loop-Invariant Code Motion: A Designed Null Result}
+The inner loop's trip count, \code{(cols - 2) >>s 1}, is recomputed for every
+row group although it is invariant; flambda2 has no loop-invariant code
+motion~\cite{aho2006dragon}, so the LICM pass hoists pure integer
+\code{let}-bindings out of GC-free loops. Hoisting unconditionally made the
+allocator spill a value inside the inner loop (visible in the assembly; the
+measured $-1.1\%$, in a separate 15-round run, is within the noise): a hoist
+is free only if its operands die, and \code{cols} does not. LICM therefore
+uses strength reduction's register-neutrality condition and, on microgpt,
+declines as designed: \code{pr_c_ivs} and \code{pr_counted} compile to the
+same code, and the measured difference, @P{pr_c_ivs,pr_counted}@, shows the
+run's resolution. Whether it hoists depends on the loop, not on this
+benchmark.
+
+\paragraph{Observation: spills track the result.} Every change that made the
+allocator spill inside the inner loop lost (carried indices, unconditional
+hoisting); every change that removed a live value or a spill won. Not every
+spill is costly: an eight-row kernel (Section~\ref{sec:simd-why}) spills four
+values per iteration yet runs as fast as the four-row kernel, because its L1
+reloads, spread over eight multiply--adds, leave slightly fewer instructions
+per multiply--add (about 3.1 against 3.25). A spill hurts when it adds work to
+every multiply--add.
+
+\subsection{The Ladder}
+Table~\ref{tab:passes} gives each pass's contribution on the pull-request
+compiler configured like the release. Counted loops (Section~\ref{sec:counted})
+come first, so that polls sit at loop exits and every pass can act; source and
+output are identical in every row.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabularx}{\textwidth}{@{}lXrr@{}}
+    \toprule
+    step & what it does & paired gain (rounds) & gap \\
+    \midrule
+    passes off (\code{pr_off}) & polls on every back edge & & @G{pr_off}@ \\
+    + counted loops & polls move to loop exits; nothing else changes & @P{pr_off,pr_c_off}@ & @G{pr_c_off}@ \\
+    + strength reduction & carries \code{base + i} as a loop parameter & @P{pr_c_off,pr_c_sr}@ & @G{pr_c_sr}@ \\
+    + interior pointers & one hoisted \code{Addr} per row, one shared index & @P{pr_c_sr,pr_c_ip}@ & @G{pr_c_ip}@ \\
+    + invariant strides & carries the row pointers across the row loop & @P{pr_c_ip,pr_c_ivs}@ & @G{pr_c_ivs}@ \\
+    + LICM (\code{pr_counted}) & declines here, by design (identical code) & @P{pr_c_ivs,pr_counted}@ & @G{pr_counted}@ \\
+    \midrule
+    all, from passes off & & \textbf{@D{pr_off,pr_counted}@} (@W{pr_off,pr_counted}@) & \\
+    \bottomrule
+  \end{tabularx}
+  \caption{The pass ladder (pull-request compiler, unchanged source, run W);
+  gap to scalar C++ in the last column.}
+  \label{tab:passes}
+\end{table}
+
+Counted loops alone only remove polls; strength reduction and interior
+pointers carry the gain. Invariant strides add nothing measurable here: with
+counted loops, interior pointers already remove this kernel's row-group
+arithmetic. With polls kept on every back edge, the four passes give only
+@P{pr_off,pr_all}@ (Section~\ref{sec:reality}).
+
+\subsection{Where Is the Rest of the Gap?}
+\label{sec:residual}
+With invariant strides the regions dominated by \code{linear} run at
+$1.15$--$1.25\times$ of scalar C++ and attention, at $1.42\times$, is the
+worst; with counted loops the picture is the same ($1.17$--$1.27\times$,
+attention $1.49\times$; Figure~\ref{fig:regions}). In isolated calls
+(Table~\ref{tab:shapes}, left), $16\times64$, with four times as many columns
+per row, has a larger gap than $64\times16$ with equal work, so part of the
+gap lives in the inner loop body.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{@{}lrrr@{\hspace{3em}}lr@{}}
+    \toprule
+    shape (rows $\times$ cols) & C++ ns & OxCaml ns & ratio & hand-written loop & ticks/iter \\
+    \midrule
+    $64\times16$ (fc1)      & 228.5 & 240.9 & $1.05\times$ & C++ shape & 2.875 \\
+    $16\times16$ (q, k, v, o) & 57.4 & 62.0 & $1.08\times$ & OxCaml shape & 3.305 \\
+    $16\times64$ (fc2)      & 209.5 & 250.0 & $1.19\times$ & \quad rotated, one branch & 3.301 \\
+    $27\times16$ (lm\_head) & 89.0 & 111.6 & $1.25\times$ & \quad loads not folded & 3.301 \\
+    $28\times16$ (no remainder) & 88.4 & 105.0 & $1.19\times$ & \quad scale 1 instead of 8 & 3.309 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Separate micro-benchmarks. Left: isolated \texttt{linear} calls,
+  scalar C++ against the invariant-strides compiler. Right: hand-written 4-MAC
+  loops, in time-stamp-counter ticks per iteration (3.0\,GHz counter, core at
+  about 4.4\,GHz: one tick is about 1.46 core cycles).}
+  \label{tab:shapes}
+\end{table}
+
+\paragraph{Loop structure.} Hand-written assembly versions of both loop shapes,
+varied one difference at a time (Table~\ref{tab:shapes}, right), showed that
+rotating the loop, un-folding the loads and changing the addressing scale are
+each worth nothing. Only the encoding (two-operand SSE in C++, three-operand
+VEX in OxCaml) moved the result, and not cleanly: run alone, the SSE loop
+slowed from 2.875 to 3.675 ticks, an SSE/AVX transition effect. A cleaner
+test: if SSE favoured C++, building C++ with VEX (\code{-mavx}) should slow it
+towards OxCaml. In run W that build is @P{cpp_novec,cpp_novec_avx}@ against
+the SSE build, so the SSE baseline is the harder one to match, not a
+flattering one.
+
+\paragraph{A model of the core.} Why is a loop with fewer instructions than
+C++'s slower? A loop can be limited by instruction issue, by its execution
+ports, or by chains of dependent instructions; only the first depends directly
+on instruction count. \code{llvm-mca} with its Alder Lake description (the closest
+available model of this machine's Meteor Lake performance cores) predicts which
+limit applies
+(Table~\ref{tab:mca}; a floating-point addition takes 2 cycles and a
+multiplication 3). It puts the patched 13-instruction loop level with C++'s
+15: both push the same eight floating-point operations through the same two
+ports, at least three cycles per iteration, so, in the model, removing integer
+instructions cannot make it faster than C++'s. The 5.2.0+ox loop's 23
+instructions exceed what the core can issue in three cycles, which is why
+removing instructions paid off until the loop reached C++'s size.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{@{}lrrrl@{}}
+    \toprule
+    inner loop & instructions & predicted & measured & predicted bound \\
+    \midrule
+    C++ scalar (\code{cpp_novec}) & 15 & 3.02 & 3.22 & floating-point ports \\
+    OxCaml, counted loops (\code{pr_counted}) & 13 & 3.02 & 3.66 & floating-point ports \\
+    OxCaml, SSE2 kernel, no polls & 16 & 3.02 & 3.46 & shuffle port \\
+    OxCaml 5.2.0+ox release & 23 & 4.02 & 5.84 & instruction issue \\
+    \bottomrule
+  \end{tabular}
+  \caption{Core cycles per 4-MAC iteration: predicted by \code{llvm-mca}, and
+  measured with each loop copied at its original alignment into a timing
+  harness (a separate measurement, 256 columns).}
+  \label{tab:mca}
+\end{table}
+
+Measured alone, the patched loop is about 14\% slower than C++'s, where the
+model predicts no difference; the cause is not identified here. This bounds
+the rest of the gap: if the inner loop were the whole story, the program would
+be at most about 14\% slower than C++; it is @G{pr_counted}@ behind, so
+by this estimate roughly half of the remaining gap lies outside the inner
+loop, in the
+row-group setup (once per four rows of only 16 columns) and in the other
+regions, attention above all.
+
+\paragraph{Attention.} The attention loops call \code{linear} and
+\code{softmax}, so the pointer passes do not apply. Swapping the value
+gather's loop nest to do four MACs per iteration over contiguous memory took
+OxCaml's attention block from 395 to 246\,ns in an isolated test, level with
+unchanged C++ (248\,ns), which would gain too.

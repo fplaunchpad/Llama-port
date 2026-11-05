@@ -1,0 +1,84 @@
+\section{Stage IX: Explicit SIMD in OxCaml}
+\label{sec:simd}
+
+The last remaining difference was vectorisation, so I added an OxCaml kernel
+that uses SIMD explicitly (build switch \code{MG_SIMD=1}). Splitting one row's
+dot product across lanes would reassociate the sum and break the bit-exact
+contract, so the kernel puts \emph{rows} in lanes, each adding the same
+products in the same order as the scalar kernel, as GCC's vectoriser does.
+
+\begin{lstlisting}[language=OCamlX,caption={The SSE2 kernel's inner loop. \texttt{F.add} and \texttt{F.mul} are \texttt{[@@builtin]} externals on the unboxed 128-bit type \texttt{float64x2\#}.},label=lst:simd]
+let rec go i (v01 : float64x2#) (v23 : float64x2#) =
+  if i >= cols then #(v01, v23)
+  else
+    let xi = unbox x.(i) in
+    let xv = F.pair xi xi in                               (* broadcast x.(i) *)
+    let r01 = F.pair (unbox d.(b0 + i)) (unbox d.(b1 + i)) in  (* rows 0, 1 *)
+    let r23 = F.pair (unbox d.(b2 + i)) (unbox d.(b3 + i)) in  (* rows 2, 3 *)
+    go (i + 1) (F.add v01 (F.mul r01 xv)) (F.add v23 (F.mul r23 xv))
+\end{lstlisting}
+
+The intrinsics are expanded inline, so no C call happens at run time. All
+SIMD builds produce the reference output.
+
+\subsection{Results: SIMD Helps Most Where the Passes Cannot Act}
+\label{fig:interaction}
+GCC's vectoriser is worth @P{cpp_novec,cpp_unroll}@ to C++. On the
+pull-request compiler with the passes off, the SSE2 kernel is worth
+@P{pr_off,pr_simd_off}@. With the passes on it adds much less:
+@P{pr_all,pr_simd}@ (interquartile range @I{pr_all,pr_simd}@) with a poll on
+every back edge, @P{pr_nopoll,pr_simd_nopoll}@ with no polls, and
+@P{pr_counted,pr_simd_counted}@ with counted loops, leaving OxCaml with the
+SSE2 kernel @G{pr_simd_counted}@ behind scalar C++, against @G{pr_counted}@
+for the scalar kernel. SIMD and the pointer passes remove
+overlapping work.
+
+\subsection{Why SIMD Adds Little to the Passes}
+\label{sec:simd-why}
+Interior pointers and the shared row index survive in the SIMD kernel
+(Listing~\ref{lst:simd-asm}); without the passes it needs four more
+\code{lea}s per iteration (20 instructions instead of 16).
+
+\begin{lstlisting}[language=asmX,caption={The SSE2 kernel's inner loop without safepoints: 16 instructions per iteration against the scalar loop's 13, the extra work being packing.},label=lst:simd-asm]
+vmovsd   -0x4(%rax,%rbp,4),%xmm2     # x[i]
+vmovapd  %xmm2,%xmm3
+vmovlhps %xmm2,%xmm3,%xmm2           # broadcast x[i] into both lanes
+vmovsd   -0x8(%r10,%rbp,4),%xmm3     # row 0: interior pointer + shared index
+vmovsd   -0x8(%r13,%rbp,4),%xmm4     # row 1
+vmovlhps %xmm4,%xmm3,%xmm3           # pack (row 0, row 1)
+vmovsd   -0x8(%r12,%rbp,4),%xmm4     # row 2
+vmovsd   -0x8(%r9,%rbp,4),%xmm5      # row 3
+vmovlhps %xmm5,%xmm4,%xmm4           # pack (row 2, row 3)
+vmulpd   %xmm2,%xmm4,%xmm4
+vaddpd   %xmm4,%xmm0,%xmm0           # accumulators for rows 2, 3
+vmulpd   %xmm2,%xmm3,%xmm2
+vaddpd   %xmm2,%xmm1,%xmm1           # accumulators for rows 0, 1
+add      $0x2,%rbp
+cmp      %rbx,%rbp
+jl       .loop
+\end{lstlisting}
+
+One row's elements are not adjacent to the next row's, so the kernel issues
+the same five scalar loads and spends three shuffles and a move packing them,
+in exchange for halving the floating-point instructions. It also has only two
+accumulators where the scalar kernel has four independent chains.
+
+If each loop is limited by its chains of dependent additions, doubling the
+chains should speed up both kernels; if by the floating-point ports, extra
+chains change nothing for the scalar kernel, while the SSE2 kernel, with half
+as many operations, may be chain-limited. An eight-row version of both
+kernels tests this (a separate 21-round run, identical output). Extra rows
+barely help the scalar kernels ($+3.8\%$ for C++, nothing for OCaml), as a
+port-limited loop predicts. The SSE2 kernel, now with four vector accumulators, gains $+5.1\%$
+over its four-row version and beats the eight-row scalar kernel by $+4.7\%$
+(21/21 rounds, with counted loops), where at four rows the two were equal in
+that run. The
+scalar loop is therefore port-limited, as the model of
+Section~\ref{sec:residual} also finds, and the four-row SSE2 kernel
+chain-limited.
+
+In the counted build's hot copy of the SIMD loop, the fallback copy's live
+values push three of the four interior pointers onto the stack (19
+instructions): SIMD and interior pointers compete for registers. SIMD is the right tool where
+the passes cannot act; with counted loops it adds a few percent, and the
+scalar kernel, simpler and free of OxCaml extensions, gets most of the way.

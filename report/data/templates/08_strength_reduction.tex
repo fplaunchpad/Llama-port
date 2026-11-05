@@ -1,0 +1,130 @@
+\section{Stage IV: Strength Reduction in the Compiler}
+\label{sec:sr}
+
+\subsection{The Missing Optimisation}
+In the inner loop \code{b_k} is invariant and \code{i} grows by a constant, so
+\code{b_k + i} is itself an induction variable that could be incremented per
+iteration instead of rebuilt with a \code{mov} and an \code{add}: \emph{strength
+reduction}~\cite{cocke1977strength}. A six-line reproducer shows that flambda2
+does not do it:
+
+\begin{lstlisting}[language=OCamlX,caption={Strength-reduction reproducer.},label=lst:sr-repro,numbers=none]
+let f (d : float array) (x : float array) b0 cols =
+  let a = ref 0.0 in
+  for i = 0 to cols - 1 do a := !a +. (d.(b0 + i) *. x.(i)) done; !a
+\end{lstlisting}
+
+\begin{lstlisting}[language=asmX,caption={Its inner loop under OxCaml 5.2.0+ox, \texttt{-O3 -unsafe}.},label=lst:sr-asm]
+.L109: movq    %rdi, %rcx                # reload the invariant b0
+       addq    %rdx, %rcx                # recompute b0 + i, every iteration
+       vmovsd  -8(%rax,%rcx,4), %xmm1    # d.(b0+i): two extra instructions
+       vmulsd  -4(%rbx,%rdx,4), %xmm1, %xmm1   # x.(i): none, i is the counter
+       vaddsd  %xmm1, %xmm0, %xmm0
+       cmpq    %rsi, %rdx
+       je      .L118
+       addq    $2, %rdx                  # i++ (tagged)
+       cmpq    (%r14), %r15              # poll
+       jbe     .L126
+       jmp     .L109
+\end{lstlisting}
+
+In the same loop \code{x.(i)} costs no extra instructions because \code{i} is
+the counter, while \code{d.(b0 + i)} costs two, with or without bounds checks.
+
+Is this cost imposed by the language or by the compiler? Writing the C++
+kernel in OCaml's index form, \code{d[b0 + i]}, separates the two: if the
+index form were inherently costly, it would carry the same extra
+instructions; if the cost lies in the compiler, GCC would remove them. It
+compiles to the same 15-instruction loop as the pointer version and runs
+equally fast (a separate 21-round run): GCC strength-reduces the index. The
+language forces OCaml into the index form, but only its compiler leaves it
+unoptimised, so a compiler pass is the right fix.
+
+\subsection{By Hand First}
+Carrying four running indices \code{j0..j3} in the source (build switch
+\code{MG_SR=1}) removed the eight rebuild instructions and the spill (on
+5.2.0+ox the loop shrank from 23 to 21 instructions), gaining
+@P{oxcaml_unsafe_unroll,oxcaml_unsafe_sr}@ on the OxCaml release.
+
+On stock OCaml 5.3.0 the same edit gave
+@P{ocaml_unsafe_unroll,ocaml_unsafe_sr}@. But a source-level workaround must be
+repeated by hand in every loop and makes the source harder to read.
+
+\subsection{Confirming the Gap in the Compiler Source}
+Neither flambda2's catalogue of optimisations nor any of 29,035 commits
+mentions loops, induction or strength; there is no loop-invariant code motion,
+value numbering or unrolling. My guide
+suggested contacting the OCaml maintainers and first opening the change as a
+pull request to my own fork.
+
+\subsection{A Strength-Reduction Pass over Cmm}
+\label{sec:sr-pass}
+I implemented the pass on Cmm rather than in flambda2
+(Figure~\ref{fig:pipeline}). Cmm has no assignment, so ``bound outside the
+loop'' \emph{is} the invariance analysis.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{diag_pipeline}
+  \caption{The new pass in the OxCaml backend; the checks on the right make
+  interior pointers safe (Section~\ref{sec:ip}).}
+  \label{fig:pipeline}
+\end{figure}
+
+The pass finds a counter \code{c} that every back edge steps by a constant
+$n$, collects variables affine in it ($m\cdot c + k$), and rewrites every sum
+\code{inv + idx}, with \code{idx} affine and \code{inv} an integer bound
+outside the loop, into a loop parameter starting at \code{inv + (m*c0 + k)}
+and stepping by $m\cdot n$:
+
+\begin{lstlisting}[language=CmmX,caption={The transformation in pseudo-Cmm (tagged index $i = 2c + 1$).},label=lst:sr-cmm]
+; before
+(catch rec (loop c a0 a1 a2 a3)
+   ... (load float64 (+a (+a d (<< (+ b1 i) 2)) -8)) ...
+   (exit loop (+ c 1) ...))
+; after: b1 + i is carried as sr1
+(catch rec (loop c a0 a1 a2 a3 sr1)
+   ... (load float64 (+a (+a d (<< sr1 2)) -8)) ...
+   (exit loop (+ c 1) ... (+ sr1 2)))
+with entry (exit loop 0 0. 0. 0. 0. (+ b1 1))
+\end{lstlisting}
+
+Both operands must be integers (a carried value is live across the back-edge
+poll, so it must never be a pointer), and variables bound more than once are
+ignored; wrapping addition is associative, so overflow behaviour is
+unchanged. Three cost rules decide whether a rewrite pays:
+
+\begin{itemize}
+  \item \textbf{Register neutrality.} The invariant must have \emph{no other
+        use} in the loop, so it dies at entry.
+  \item \textbf{Only sums that must be materialised.} OCaml's tagged indices
+        reach Cmm as \code{(base + i) - 1}, which x86 forms with one
+        \code{lea}; carrying such a sum only adds an \code{add} and a live
+        register. Skipping these sums makes nx-oxcaml's element-wise kernels
+        1.10--1.14$\times$ faster under default flags, the passes-off speed
+        (a separate 15-round run).
+  \item \textbf{At most eight carried values.} Without this cap a loop with 24
+        such sums ran 1.65$\times$ slower than with the pass off; with it, the
+        loop runs at the passes-off speed.
+\end{itemize}
+
+The pass sits behind \code{-[no-]cmm-strength-reduction}; with the flag off
+the code is byte-identical.
+
+\subsection{Results}
+\begin{itemize}
+  \item \textbf{Correctness.} 17 hand-written edge cases (counting down,
+        overflow, exceptions, forced major GCs) and 30 random programs match
+        the pass off; Section~\ref{sec:counted} gives the test suite.
+  \item \textbf{Speed on unmodified source.} @P{pr_c_off,pr_c_sr}@ on the
+        final compiler with counted loops (Table~\ref{tab:passes}), and
+        @P{ox54_base,ox54_sr}@ on the compilers built without polls, close to
+        the hand edit's @D{oxcaml_unsafe_unroll,oxcaml_unsafe_sr}@.
+  \item \textbf{Code.} The pass leaves one re-tag the hand edit does not,
+        \ainl|leaq 1(%r10,%r10)|, from the translation to Cmm; interior
+        pointers (Section~\ref{sec:ip}) remove it.
+\end{itemize}
+
+The pass does not cover non-constant strides (Section~\ref{sec:ivs}) or
+invariant expressions that flambda2 has inlined into an address, which
+explains the crypto-study result (Section~\ref{sec:crypto}).

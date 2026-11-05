@@ -1,0 +1,62 @@
+From fb0e22878d4ffede031506c0ebce52c237ebac61 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:28 +0000
+Subject: [PATCH 09/24] 01-cap-strength-reduction-params
+
+---
+ backend/cmm_strength_reduction.ml | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index 8d757b3fa0..95870a5165 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -341,6 +341,21 @@ let rec replace_sum ~affines ~pair ~derived expr =
+   | Some _ | None ->
+     map_subexpressions (replace_sum ~affines ~pair ~derived) expr
+ 
++(* At most this many values may be carried in integer registers by a loop
++   that [reduce] adds a parameter to, its own parameters included. A carried
++   sum replaces an invariant that dies, which is register-neutral only while
++   the loop's values fit in registers; once they spill, a carried sum costs a
++   load, an addition and a store per iteration where the sum it replaces cost
++   a load and an addressing mode. *)
++let max_int_carried = 8
++
++let is_int_register_machtype (machtype : machtype) =
++  Array.length machtype = 1
++  &&
++  match machtype.(0) with
++  | Int | Val | Addr -> true
++  | Float | Float32 | Vec128 | Vec256 | Vec512 | Mask | Valx2 -> false
++
+ let nth_arg args index =
+   match List.nth_opt args index with
+   | Some arg -> arg
+@@ -412,6 +427,12 @@ let reduce ~duplicated ~int_vars ~label ~expr =
+       (fun (invariant, _) -> usable invariant)
+       (sum_candidates ~affines handler.body)
+   in
++  let carried_already =
++    List.length
++      (List.filter
++         (fun (_, machtype) -> is_int_register_machtype machtype)
++         handler.params)
++  in
+   let derived, handler_body =
+     List.fold_left
+       (fun (derived, handler_body) pair ->
+@@ -420,7 +441,9 @@ let reduce ~duplicated ~int_vars ~label ~expr =
+         (* If the invariant is still needed inside the loop for something other
+            than this sum, then carrying the sum as well costs a register rather
+            than saving one, so leave the candidate alone. *)
+-        if occurs (fst pair) rewritten
++        if
++          occurs (fst pair) rewritten
++          || carried_already + List.length derived >= max_int_carried
+         then derived, handler_body
+         else (pair, var) :: derived, rewritten)
+       ([], handler.body) candidates
+-- 
+2.47.3
+

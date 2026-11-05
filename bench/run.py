@@ -85,7 +85,7 @@ IMPLS = {
     # Correctness is platform-independent (verified: identical output under Windows UCRT
     # and Linux glibc), so the agreement gate covers them here - but a WSL binary timed
     # against Windows-native ones would measure the OS, so they are excluded from the
-    # speed table. Use tools/bench_wsl.sh for their timings.
+    # speed table. bench/bench.py times them, all inside one Linux environment.
     "ocaml": dict(
         label="OCaml",
         run=(["wsl.exe", "-d", "Debian", "--",

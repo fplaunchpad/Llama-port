@@ -1,0 +1,66 @@
+\section{Stage III: The Safepoint Tax}
+\label{sec:polls}
+
+My guide suggested pricing the poll with two experiments that bracket its cost.
+
+\subsection{Two Ways to Remove a Poll}
+\begin{itemize}
+  \item \textbf{NOP patch (lower bound).} \code{tools/nop_polls.py}
+        overwrites every \ainl|cmp (%r14),%r15| plus \code{jbe} pair (a poll)
+        in the linked binary with multi-byte NOPs, aborting unless every poll
+        is gone and the count of similar-looking allocation checks is
+        unchanged (in the first binary patched, 853 polls and 1,263 checks).
+        The output stays bit-identical, and registers and layout are
+        untouched.
+  \item \textbf{Compiler flag (upper bound).} \code{-disable-poll-insertion}
+        recompiles without polls, so the compiler can re-optimise around
+        their absence.
+\end{itemize}
+
+Removing polls is correct for single-domain microgpt, not in general
+(Section~\ref{sec:reality}).
+
+\subsection{Results: What You Remove Is Not What You Pay}
+\label{fig:polls}
+On the release's plain kernel, which executes about four times as many
+back-edge polls as the unrolled one, the NOP patch gains
+@P{oxcaml_unsafe_plain,oxcaml_unsafe_plain_pollnop}@ and the flag
+@P{oxcaml_unsafe_plain,oxcaml_unsafe_plain_pollfree}@. On the unrolled kernel
+the NOP patch gains @P{oxcaml_unsafe_unroll,oxcaml_unsafe_unroll_pollnop}@
+(interquartile range @I{oxcaml_unsafe_unroll,oxcaml_unsafe_unroll_pollnop}@)
+and the flag @P{oxcaml_unsafe_unroll,oxcaml_unsafe_unroll_pollfree}@.
+Executing the poll costs a few percent at most; recompiling without polls can
+be worth several times that. On the unrolled kernel the two are close because
+5.4.0-ox7's poll-free build re-tags the index with an extra \code{lea} that
+forces a spill: it is @A{oxcaml52_unsafe_unroll_pollfree,oxcaml_unsafe_unroll_pollfree}@
+slower than the same build on the previous release, 5.2.0+ox.
+
+\subsection{The \texorpdfstring{\%r11}{r11} Exclusion}
+\label{sec:r11}
+On 5.2.0+ox, without polls \code{linear} shrinks from 102 to 91 instructions, its one
+stack spill disappears, and register \reg{r11} goes from 0 uses to 8. The
+backend declares \reg{r11} destroyed at every poll and allocation
+(\code{destroyed_at_alloc_or_poll} in \code{backend/amd64/proc.ml}), so with a
+poll in the loop the allocator spills a row base.
+
+A binary patch that rewrote the two spill instructions into moves through
+\reg{r11} (same instruction count, no spill) gained only $+0.3\%$ (7/11
+rounds, a separate run): the slot is in L1 and off the critical floating-point
+chain, so the spill is not where the poll's cost lies. The runtime does save
+\reg{r11} in \code{SAVE_ALL_REGS}~\cite{ocaml_runtime}, and an OCaml core
+developer told me the exclusion may be redundant in the non-PLT
+configuration; settling it needs a test that forces the slow path with a
+pointer in \reg{r11}.
+
+What, then, makes the flag worth more than the poll it removes? On the
+release it changes code layout, block structure and register allocation
+together, and these experiments cannot separate them. On the patched compiler
+most of the value of removing polls is in the optimisations their absence
+\emph{permits} (Section~\ref{sec:reality}).
+
+\paragraph{Configuration for the next stages.} Stages IV to VI develop the
+passes on compilers built without poll insertion, to study the address
+arithmetic with no poll in the loop; Stage VII measures them with polls on,
+the configuration OxCaml is released with. The final measurement of each pass
+(Table~\ref{tab:passes}) uses the pull-request compiler configured like the
+release, with counted loops (Section~\ref{sec:counted}).

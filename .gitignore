@@ -13,15 +13,29 @@ impl/ocaml/build/
 __pycache__/
 *.pyc
 
-# Logs and scratch
+# Logs and scratch (the region-profile log behind the report's Figure 6 is data)
 *.log
+!report/data/profile_regions.log
 
 # Exported chat transcripts. Local record only - never committed. These contain the
 # full session log including file contents and command output.
 chats/
 
+# Output of bench/run.py; the measured numbers live in report/data/.
+bench/results/
+
+# LaTeX build products of report/
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.out
+report/*.toc
+report/*.fdb_latexmk
+report/*.fls
+report/*.synctex.gz
+
 # Kept on purpose (do not ignore):
 #   weights/microgpt.bin   - lets a reviewer verify the golden values without training
 #   data/*.txt             - the exact evaluation splits the numbers come from
 #   input.txt              - the source corpus, so the repo reproduces offline
-#   bench/results/*.json   - the evidence behind the reported numbers
+#   report/data/run_w_*.txt - the raw measurements behind every microgpt number

@@ -1,0 +1,60 @@
+From 9d93960d58f1100753bb02d483106c0ae90e53a0 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:29 +0000
+Subject: [PATCH 16/24] 08-licm-corrected-occurrence-counts
+
+---
+ backend/cmm_strength_reduction.ml | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index c8a1a10704..786d2b56ab 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -117,6 +117,25 @@ let occurrence_counts expr =
+   loop expr;
+   !counts
+ 
++(* [counts] are the occurrence counts of the whole function as it was, and
++   [original] is one of its subexpressions, which the rewrite has turned into
++   [current]. The counts of the function with [current] in place of
++   [original]: rewriting the loops inside [original] first may have added
++   reads (a fallback copy reads everything the loop it copies reads) or moved
++   them. Rewrites elsewhere in the function are not accounted for; none of
++   them takes away the last read of a variable that had one. *)
++let corrected_counts ~counts ~original ~current =
++  let before = occurrence_counts original in
++  let after = occurrence_counts current in
++  let get map v = Option.value ~default:0 (V.Map.find_opt v map) in
++  let vars =
++    V.Map.fold (fun v _ acc -> V.Set.add v acc) after
++      (V.Map.fold (fun v _ acc -> V.Set.add v acc) counts V.Set.empty)
++  in
++  V.Set.fold
++    (fun v acc -> V.Map.add v (get counts v - get before v + get after v) acc)
++    vars V.Map.empty
++
+ (* Variables bound more than once in a function body. [Cmm] is normally in
+    single-binding form, but expressions do get duplicated on the way here, and
+    the analysis below reasons about a variable from its binding, so a variable
+@@ -2514,6 +2533,7 @@ let rec rewrite (config : config) int_vars expr =
+     in
+     Clet (v, def, rewrite int_vars body)
+   | Ccatch (flag, handlers, body) -> (
++    let original_node = expr in
+     (* Bottom-up, so that an inner loop is already in its final form when the
+        loop enclosing it is examined. *)
+     let handlers =
+@@ -2544,6 +2564,9 @@ let rec rewrite (config : config) int_vars expr =
+           if not (licm && (relaxed || !Oxcaml_flags.cmm_licm_polled))
+           then [], expr
+           else
++            let counts =
++              corrected_counts ~counts ~original:original_node ~current:expr
++            in
+             match
+               hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr
+             with
+-- 
+2.47.3
+

@@ -1,0 +1,84 @@
+From 98abdd29c723dd10dd1978797be4a64fc966d151 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:30 +0000
+Subject: [PATCH 21/24] 13-document-new-options-and-target-assumptions
+
+---
+ backend/cmm_strength_reduction.ml  |  9 ++++++++-
+ backend/cmm_strength_reduction.mli | 19 ++++++++++++++++---
+ 2 files changed, 24 insertions(+), 4 deletions(-)
+ mode change 100755 => 100644 backend/cmm_strength_reduction.mli
+
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index 0130b51d56..49265762ef 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -1027,7 +1027,14 @@ let scale_by n expr dbg =
+ 
+ (* The scales an x86 addressing mode can apply to its index register. A wider
+    step would need a shift inside the loop, which is what this pass is trying to
+-   remove. *)
++   remove.
++
++   Other targets: arm64 has no scaled-index addressing mode at all; its
++   instruction selection turns [base + (index << k)] into one shifted add, for
++   any [k], followed by a load at a constant displacement. The rewritten
++   address costs that one instruction there too, so restricting the step to
++   the x86 scales only declines rewrites arm64 could also take; it does not
++   make arm64 code worse. (Not tested: no arm64 build was available.) *)
+ let is_addressing_scale n = n = 0 || n = 1 || n = 2 || n = 4 || n = 8
+ 
+ let same_base (root, invariant, bytes) (root', invariant', bytes') =
+diff --git a/backend/cmm_strength_reduction.mli b/backend/cmm_strength_reduction.mli
+old mode 100755
+new mode 100644
+index c6676a6f25..d640989eaf
+--- a/backend/cmm_strength_reduction.mli
++++ b/backend/cmm_strength_reduction.mli
+@@ -34,7 +34,9 @@
+     - Strength reduction (on by default, [-no-cmm-strength-reduction]): a sum
+       [b + i] of a loop-invariant [b] and an affine function [i] of a counter
+       that every exit steps by a constant or resets is carried in a new loop
+-      parameter, so the addition leaves the loop.
++      parameter, so the addition leaves the loop. Only sums that the backend
++      would have to materialise are carried, and only while the loop's
++      integer values fit in registers.
+ 
+     - Interior pointers ([-no-cmm-interior-pointers]): in a loop that cannot
+       reach a safepoint, the invariant part of an array address is formed once
+@@ -47,7 +49,9 @@
+ 
+     - Loop-invariant code motion ([-no-cmm-licm]): pure, total integer bindings
+       whose operands are bound outside the loop are bound before it, when that
+-      does not add a live range the loop cannot afford.
++      does not add a live range the loop cannot afford. In a loop that may
++      reach a safepoint, only bindings of integer operands are hoisted
++      ([-no-cmm-licm-polled] turns that off).
+ 
+     - Counted loops ([-cmm-counted-loops], off by default): a GC-free loop whose
+       termination is proved (exactly, in 64-bit wrapping arithmetic; otherwise
+@@ -55,11 +59,20 @@
+       back-edge poll and polls on its exits instead, and is then given the
+       pointer passes even when the unit polls. [-cmm-unchecked-loops] does the
+       same without the proof, at the cost of liveness only.
++      [-cmm-counted-loops-max-trips n] also requires a counted loop to end
++      within about [n] iterations, checked on entry, which bounds how long it
++      can delay a stop-the-world collection. The polled copies made for entry
++      checks may add at most twice the function's own size; a loop whose copy
++      would exceed that keeps its poll.
+ 
+     A derived pointer is never live across a safepoint: the pointer passes
+     only act where none can occur (a unit compiled without polling, or a
+     counted loop), and the emitter rejects an [Addr] live at a frame
+     descriptor ("bad GC root"). [-dcounted-loops] prints each counted-loop
+-    decision. See the implementation for the exact conditions. *)
++    decision, and [-dcmm-loops] the [Cmm] of each function after these passes.
++
++    The cost model is tuned for amd64 (addressing-mode scales, [lea]); on
++    other 64-bit targets the rewrites are correct but untested. See the
++    implementation for the exact conditions. *)
+ 
+ val fundecl : Cmm.fundecl -> Cmm.fundecl
+-- 
+2.47.3
+

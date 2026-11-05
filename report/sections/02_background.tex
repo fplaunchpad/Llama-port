@@ -1,0 +1,156 @@
+\section{Background}
+\label{sec:background}
+
+\subsection{The microgpt Model}
+\label{sec:model}
+
+microgpt is a one-layer decoder-only transformer~\cite{vaswani2017attention}
+in the GPT-2 style~\cite{radford2019gpt2}, simplified in three ways: RMSNorm
+without a learned gain instead of LayerNorm~\cite{zhang2019rmsnorm}, no biases,
+and ReLU instead of GeLU. Table~\ref{tab:model} lists its shape. I trained it
+once (1,000 Adam steps, loss $3.37 \to 2.32$) and exported the weights to a
+binary file that every port reads.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{@{}ll@{\hspace{2.2em}}ll@{}}
+    \toprule
+    layers & 1 & vocabulary & 27 (26 letters + BOS) \\
+    embedding width & 16 & context length & 16 tokens \\
+    heads $\times$ head width & $4 \times 4$ & MLP hidden width & 64 \\
+    normalisation & RMSNorm, $(\overline{x^2} + 10^{-5})^{-1/2}$ & parameters & 4,192 (f64) \\
+    \bottomrule
+  \end{tabular}
+  \caption{microgpt hyperparameters.}
+  \label{tab:model}
+\end{table}
+
+One function, \code{linear}, applies all weight matrices
+(Figure~\ref{fig:forward}): a matrix--vector product whose outputs are dot
+products of a weight row with the input. Its 3,504 multiply--accumulates (MACs)
+per token are over 90\% of the model's arithmetic, so it is the hot loop.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{diag_forward}
+  \caption{One microgpt forward pass. Blue boxes call \texttt{linear}, with
+  their multiply--accumulate counts.}
+  \label{fig:forward}
+\end{figure}
+
+The model's 33.5 KB of weights fit in the 48 KB L1 data cache, so the
+benchmark measures per-operation overhead, not memory bandwidth.
+
+\subsection{OCaml Values, Arrays and Bounds Checks}
+\label{sec:ocaml-values}
+
+OCaml uses a uniform value representation~\cite{minsky2022rwo}: a value is one
+machine word, either an integer tagged in its least significant bit ($n$ is
+stored as $2n+1$) or a pointer to just after a heap block's header word. A
+\code{float array} stores unboxed 8-byte doubles, so a row-major weight matrix
+has the layout of a C \code{double[]}.
+
+Indexing \code{a.(i)} is bounds-checked unless compiled with \code{-unsafe}.
+Tagged indices are free: for index $2i+1$, the byte offset $8i = 4(2i+1) - 4$ is
+computed by the x86 addressing mode \code{-4(base,index,4)}.
+
+\subsection{Garbage Collection and Safepoint Polls}
+\label{sec:gc-polls}
+
+OCaml's garbage collector is precise and moving: a minor collection copies live
+objects and updates every pointer to them. With
+\emph{domains}~\cite{sivaramakrishnan2020retrofitting}, minor collections are
+stop-the-world: a domain needing one waits until every other domain reaches a
+\emph{safepoint}. Allocations and calls are safepoints; a loop with neither
+could run for ever, so the compiler puts a \emph{poll} on the back edge of any
+loop it cannot prove safe:
+
+\begin{lstlisting}[language=asmX,caption={A GC safepoint poll on x86-64: compare the young-heap pointer (\%r15) with the limit stored in the domain state (\%r14). The runtime raises the limit above any heap address to request a safepoint, so the next comparison takes the branch.},label=lst:poll,numbers=none]
+cmpq   (%r14), %r15        # young_ptr vs young_limit
+jbe    .Lcall_gc           # limit raised -> enter the runtime
+\end{lstlisting}
+
+Polls let signals be handled and other domains' collections make progress.
+Single-domain programs such as microgpt do not need them, and OxCaml offers
+\code{-disable-poll-insertion}, but removing polls from a multi-domain program
+can deadlock it. This tension drives the second half of the project.
+
+\subsection{Interior Pointers}
+\label{sec:bg-interior}
+
+A C++ kernel walks a pointer to each row. OCaml cannot: a pointer into the
+middle of an array has no header, so the GC could neither tell which block it
+belongs to nor update it when the block moves (Figure~\ref{fig:layout}), and
+every access \code{d.(b1 + i)} recomputes \code{b1 + i}. The compiler's
+\emph{derived} pointers (Cmm type \code{Addr}) may never be live where a
+collection can happen, or the compiler stops with \code{bad GC root}.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{diag_layout}
+  \caption{Left: C++ walks four row pointers with one shared offset. Right: an
+  OCaml \texttt{float array} keeps its header in front of the data; a pointer
+  into a row is legal only where no collection can happen.}
+  \label{fig:layout}
+\end{figure}
+
+Other collected systems record at every safepoint how to recompute derived
+pointers from their base~\cite{diwan1992compiler, llvm_statepoints}; OCaml's
+frame tables have no such entries.
+
+\subsection{OxCaml and the flambda2 Pipeline}
+\label{sec:bg-pipeline}
+
+OxCaml~\cite{oxcaml} extends OCaml with unboxed types, stack allocation, modes
+and SIMD intrinsics, and replaces the classic optimiser with \emph{flambda2}.
+After flambda2 the pipeline translates to \emph{Cmm} (a first-order language
+in which a loop is a recursive \code{catch} whose parameters are the
+loop-carried values), builds a control-flow graph, inserts safepoint polls,
+allocates registers and emits assembly. Stock OCaml uses the older
+\emph{closure} middle end. Section~\ref{sec:method} lists the compilers used.
+
+\subsection{Instruction-Level Parallelism}
+\label{sec:bg-ilp}
+
+A dot product \code{acc += w[i] * x[i]} is a chain of dependent floating-point
+additions, each waiting several cycles for the previous
+one~\cite{fog_tables}. Computing four output rows at once gives the core four
+independent chains to overlap (Figure~\ref{fig:ilp}); each row still adds its
+terms left to right, so the result is bit-identical. An out-of-order core can
+already overlap consecutive rows' chains, so the gain depends on how much
+overlap the original loop allowed.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.92\textwidth]{diag_ilp}
+  \caption{One chain of dependent additions versus four, one per output row;
+  each row's summation order is unchanged.}
+  \label{fig:ilp}
+\end{figure}
+
+\subsection{Related Work}
+\label{sec:related}
+Strength reduction of induction variables is
+classical~\cite{cocke1977strength,allen1981strength}, and LLVM implements it in
+\code{loop-reduce} and
+\code{indvars}~\cite{llvm_passes}; LICM is textbook~\cite{aho2006dragon}. What
+is specific here are the cost decisions for OCaml's tagged integers and
+x86 addressing (Section~\ref{sec:sr-pass}).
+
+Collected languages bound the time to a safepoint in several ways. OCaml
+inserts polls since its safepoints work~\cite{ocaml_safepoints}; GHC omits
+yield points in non-allocating loops unless \code{-fno-omit-yields} is
+given~\cite{ghc_yields}. HotSpot's C2 compiler omits the back-edge safepoint of
+\code{int} counted loops (\code{UseCountedLoopSafepoints}) and bounds the
+resulting latency by \emph{strip mining}: an outer polled loop around counted
+strips of \code{LoopStripMiningIter} iterations~\cite{jdk_stripmining}.
+Graal's \code{LoopSafepointEliminationPhase} removes back-edge safepoints from
+short counted loops~\cite{graal_safepoints}.
+
+My counted loops follow C2's design, adapted to an ahead-of-time compiler: a
+polled fallback copy, chosen by one check on entry, replaces deoptimisation,
+and the termination proof is exact in wrapping arithmetic. The OCaml-specific
+part is confining derived pointers to loop regions the collector cannot
+enter, since OCaml's frame tables cannot describe them
+(Section~\ref{sec:bg-interior}).

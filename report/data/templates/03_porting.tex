@@ -1,0 +1,90 @@
+\section{Porting microgpt to Five Languages}
+\label{sec:porting}
+
+\subsection{The Ports}
+A plain-float Python reference (\code{impl/python/infer.py}) matches the
+original's autograd forward pass to a largest relative difference of
+$1.26\times10^{-13}$ over 9,585 logits, and specifies the other four ports
+(Table~\ref{tab:ports}). Every port is dependency-free, so the benchmark
+compares languages, not libraries.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabularx}{\textwidth}{@{}lXrl@{}}
+    \toprule
+    port & compiler and flags (benchmark) & lines & notes \\
+    \midrule
+    Python & CPython 3.13.5 & 480 & reference; explicit loops, no NumPy \\
+    C++ & g++ 14.2, \code{-O3 -fno-fast-math} \code{-ffp-contract=off} & 845 & raw row pointers \\
+    Rust & rustc 1.98.1, \code{--release} & 1,095 & safe Rust, iterator kernels \\
+    OCaml & stock ocamlopt 5.3.0 (closure), \code{-unsafe} & 791 & same program as OxCaml$^\dagger$ \\
+    OxCaml & OxCaml ocamlopt 5.4.0-ox7 (flambda2), \code{-O3 -unsafe} & 782 & same program as OCaml$^\dagger$ \\
+    \bottomrule
+  \end{tabularx}
+  \caption{The five ports. Line counts include weight loading, harness and
+  JSON reporting (the model is about 115 lines). $^\dagger$One program in
+  standard OCaml; the two files differ only in comments and port-name strings,
+  and the build refuses to proceed if they drift apart.}
+  \label{tab:ports}
+\end{table}
+
+That program uses no OxCaml language extensions, so any difference between
+the two rows is a difference between compilers; the only OxCaml-specific code
+is the optional SSE2 kernel of Section~\ref{sec:simd}. Weights live in one
+flat \code{float array} per matrix and accumulators are \code{float ref}s,
+which both compilers keep unboxed. Allocation is 12.9 words per forward pass,
+so the 256k-word minor heap fills only about once every 20,000 forward passes.
+
+\subsection{A Bit-Exact Numerical Contract}
+\label{sec:contract}
+
+Agreement ``within a tolerance'' is too weak to catch porting bugs, so a
+contract (\code{BENCHMARK.md}) pins every operation whose result could differ:
+
+\begin{itemize}
+  \item all arithmetic in \code{f64}; sums accumulated left to right in a plain
+        loop, never compensated or pairwise; no fused multiply--add and no
+        fast-math (\code{-ffp-contract=off}, no \code{mul_add});
+  \item RMSNorm scale as \code{pow(ms + 1e-5, -0.5)} and attention scale as
+        \code{pow(head_dim, 0.5)}, never \code{1/sqrt};
+  \item ReLU written \code{x > 0 ? x : 0} (which maps NaN to 0), and logits
+        divided by the temperature rather than multiplied by its reciprocal;
+  \item sampling with a portable xorshift64*
+        generator~\cite{marsaglia2003xorshift,vigna2016xorshift} and an ascending
+        cumulative-sum scan with a strict \code{<} comparison.
+\end{itemize}
+
+Each run reports a perplexity over 2,000 held-out names (14,307 tokens), an
+FNV-1a 64-bit hash~\cite{fnv} of all generated text, weight checksums and the
+first four random numbers. The harness refuses to rank any port whose
+checksums, draws or hash differ, or whose perplexity differs by more than
+$10^{-9}$ relative. All five ports give the same perplexity in all 17
+printed digits, $10.789614873329409$ (better than a bigram model's 12.33, a unigram model's
+17.00 and the uniform 27.00) and the same hash, \code{0xae6c6ffbd8f5b02c}, for 200
+samples. The logits themselves are not compared bit by bit, so these checks
+make a difference in their last bits very unlikely but do not exclude it.
+
+\subsection{Pitfalls the Contract Rules Out}
+\label{sec:traps}
+
+Several ordinary idioms change the last bit of the result, or the order of
+side effects, in one language but not another (Table~\ref{tab:bugs}).
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabularx}{\textwidth}{@{}lXX@{}}
+    \toprule
+    language & pitfall & rule \\
+    \midrule
+    Python & \code{sum()} in CPython $\geq$ 3.12 uses Neumaier compensated summation~\cite{neumaier1974,python312sum}, more accurate than the other ports (Section~\ref{sec:challenges}) & explicit left-to-right loops \\
+    Rust, C++ & \code{if x <= 0 {x = 0}} keeps NaN, because \code{NaN <= 0} is false & ReLU written \code{x > 0 ? x : 0} \\
+    all & summing the loss per token or per document differs ($10^{-16}$) & accumulate per document, then add \\
+    OCaml & \code{Array.init} leaves its call order unspecified, which matters when reading the weight file or drawing random numbers & explicit loops wherever order matters \\
+    \bottomrule
+  \end{tabularx}
+  \caption{Idioms that make ports diverge silently; none changes the generated
+  text.}
+  \label{tab:bugs}
+\end{table}

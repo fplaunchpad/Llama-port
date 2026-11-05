@@ -1,0 +1,110 @@
+\section{Stage I: Source-Level Optimisation}
+\label{sec:stage1}
+
+\subsection{First Numbers}
+The first OxCaml port (\code{-O3}, bounds checks on, one accumulator per row;
+\code{oxcaml_safe_plain}) is \textbf{@G{oxcaml_safe_plain}@ slower} than
+scalar C++ and @GU{oxcaml_safe_plain}@ slower than vectorised C++.
+Table~\ref{tab:uniform} shows the five ports at the end of the source-level
+work, including the hand strength reduction of Section~\ref{sec:sr}.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabular}{@{}llrrl@{}}
+    \toprule
+    port & build & tokens/s & vs Python & perplexity \\
+    \midrule
+    C++    & g++ 14.2 \code{-O3}, unrolled & @T{cpp_unroll}@ & @Y{cpp_unroll}@ & 10.789614873329409 \\
+    Rust   & rustc 1.98.1 \code{--release}, unrolled & @T{rust_unroll}@ & @Y{rust_unroll}@ & 10.789614873329409 \\
+    OxCaml & 5.4.0-ox7 \code{-O3 -unsafe}, unrolled, hand s.r. & @T{oxcaml_unsafe_sr}@ & @Y{oxcaml_unsafe_sr}@ & 10.789614873329409 \\
+    OCaml  & 5.3.0 \code{-unsafe}, unrolled, hand s.r. & @T{ocaml_unsafe_sr}@ & @Y{ocaml_unsafe_sr}@ & 10.789614873329409 \\
+    Python & CPython 3.13.5 & @T{python}@ & $1\times$ & 10.789614873329409 \\
+    \bottomrule
+  \end{tabular}
+  \caption{The five ports' best builds without compiler changes in run W
+  (median of 21 interleaved rounds; s.r., strength reduction), all with
+  identical output.}
+  \label{tab:uniform}
+\end{table}
+
+\subsection{Rust: Three Small Changes}
+Three changes, each worth a few percent at most and part of every Rust build,
+brought Rust level with C++: hoisting the per-layer KV-cache slices out of the
+attention loops; iterating \code{linear} with \code{chunks_exact(cols)}, so
+the bounds are proved once per row; and precomputing the attention scale (no
+measurable effect: LLVM already turns \code{pow(x, 0.5)} into a square root).
+
+\subsection{Fairness Corrections and Bounds Checks}
+\label{tab:bounds}
+C++ is built with \code{-O3} to match Cargo's opt-level 3 (worth
+@P{cpp_O2_plain,cpp_plain}@ over \code{-O2} on the plain kernel). OCaml's
+\code{-unsafe} removes bounds checks, as C++ does by default; Rust keeps its
+checks, and LLVM removes them by proof. The price of bounds checks is not
+fixed. For stock OCaml on the plain kernel \code{-unsafe} gains only
+@P{ocaml_safe_plain,ocaml_unsafe_plain}@, consistent with the checks executing
+in the shadow of the single serial chain of additions; on the unrolled kernel
+it gains @P{ocaml_safe_unroll,ocaml_unsafe_unroll}@. For OxCaml the checks are
+expensive on both kernels: @P{oxcaml_safe_plain,oxcaml_unsafe_plain}@ and
+@P{oxcaml_safe_unroll,oxcaml_unsafe_unroll}@.
+
+\subsection{The Largest Single Change: Unrolling the Rows}
+\label{sec:unroll}
+Unrolling \code{linear} to compute four rows at once
+(Listing~\ref{lst:unrolled}; Section~\ref{sec:bg-ilp}) gave OxCaml
+@P{oxcaml_unsafe_plain,oxcaml_unsafe_unroll}@ and stock OCaml
+@P{ocaml_unsafe_plain,ocaml_unsafe_unroll}@, while the same unroll gave C++
+@P{cpp_plain,cpp_unroll}@ and Rust only @P{rust_plain,rust_unroll}@
+(Figure~\ref{fig:unroll}). The unroll gives four independent accumulators
+instead of one, and one load of \code{x.(i)} shared by four rows. Its value
+depends on how well each compiler's plain loop already ran: plain Rust is
+within @R{cpp_novec,rust_plain}@ of scalar C++, plain stock OCaml
+@G{ocaml_unsafe_plain}@ behind it. Section~\ref{sec:simd-why} tests whether
+four chains are enough.
+
+\begin{lstlisting}[language=OCamlX,caption={The shipped OCaml kernel: four rows, four independent accumulators, each row summed left to right (C++ and Rust alike).},label=lst:unrolled]
+let linear (x : float array) (w : mat) (out : float array) =
+  let cols = w.cols and rows = w.rows and d = w.d in
+  let o = ref 0 in
+  while !o + 4 <= rows do
+    let b0 = !o * cols in
+    let b1 = b0 + cols and b2 = b0 + (2 * cols) and b3 = b0 + (3 * cols) in
+    let a0 = ref 0.0 and a1 = ref 0.0 and a2 = ref 0.0 and a3 = ref 0.0 in
+    for i = 0 to cols - 1 do
+      let xi = x.(i) in
+      a0 := !a0 +. (d.(b0 + i) *. xi);
+      a1 := !a1 +. (d.(b1 + i) *. xi);
+      a2 := !a2 +. (d.(b2 + i) *. xi);
+      a3 := !a3 +. (d.(b3 + i) *. xi)
+    done;
+    out.(!o) <- !a0; out.(!o + 1) <- !a1;
+    out.(!o + 2) <- !a2; out.(!o + 3) <- !a3;
+    o := !o + 4
+  done
+  (* remainder rows: one accumulator each *)
+\end{lstlisting}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.78\textwidth]{fig_unroll}
+  \caption{The same source change on three compilers (run W, paired median and
+  rounds won).}
+  \label{fig:unroll}
+\end{figure}
+
+\subsection{Two OCaml Compilers}
+On the plain kernel flambda2 is @P{ocaml_safe_plain,oxcaml_safe_plain}@ faster
+than the closure middle end (@P{ocaml_unsafe_plain,oxcaml_unsafe_plain}@ with
+\code{-unsafe}); on the unrolled kernel it shrinks to
+@P{ocaml_unsafe_unroll,oxcaml_unsafe_unroll}@. On the plain kernel the closure
+compiler does not inline the inner loop's local function: it allocates a
+closure per row and keeps the accumulator boxed, so each multiply--add costs
+21 instructions and 16 bytes of allocation. flambda2 turns it into a loop with
+the accumulator in a register (12 instructions, no allocation). The unrolled
+kernel is already a loop, and there the two compilers are close.
+
+\subsection{Where Stage I Ended}
+OxCaml became @R{oxcaml_unsafe_unroll,oxcaml_safe_plain}@ faster than its first
+version, and the gap to scalar C++ fell from @G{oxcaml_safe_plain}@ to
+@G{oxcaml_unsafe_unroll}@ (@GU{oxcaml_unsafe_unroll}@ to vectorised C++).
+Everything after this leaves the OCaml source alone.

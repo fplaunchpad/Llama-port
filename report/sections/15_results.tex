@@ -1,0 +1,143 @@
+\section{Summary of Results}
+\label{sec:results}
+
+Figure~\ref{fig:ladder} puts the whole evolution on one axis.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{fig_gap_ladder}
+  \caption{Closing the gap (run W): scalar C++ throughput over each OCaml
+  variant's. Every build keeps its polls (on back edges, or at loop exits with
+  counted loops). The SSE2 bar adds one change to the last ladder step.
+  Abbreviations: s.r., strength reduction; i.p., interior pointers;
+  inv.\ str., invariant-stride induction variables.}
+  \label{fig:ladder}
+\end{figure}
+
+\subsection{Every Final Configuration}
+\label{sec:unified}
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabularx}{\textwidth}{@{}Xrrr@{}}
+    \toprule
+    configuration (same OCaml source unless noted) & tokens/s & vs scalar C++ & vs vectorised C++ \\
+    \midrule
+    C++ vectorised (\code{cpp_unroll}) & 772,261 & $0.93\times$ & $1.00\times$ \\
+    C++ scalar (\code{cpp_novec}) & 716,505 & $1.00\times$ & $1.08\times$ \\
+    Rust (\code{rust_unroll}, bounds-checked) & 703,295 & $1.02\times$ & $1.10\times$ \\
+    \midrule
+    stock OCaml 5.3.0, first port (\code{ocaml_safe_plain}) & 121,019 & $5.92\times$ & $6.38\times$ \\
+    \quad \code{-unsafe}, unrolled, hand s.r.\ (\code{ocaml_unsafe_sr}) & 448,265 & $1.60\times$ & $1.72\times$ \\
+    \quad \code{-unsafe}, unrolled, ported passes + counted loops (\code{ocaml_pr_counted}) & 493,014 & $1.45\times$ & $1.57\times$ \\
+    \midrule
+    OxCaml 5.4.0-ox7 release, first port (\code{oxcaml_safe_plain}) & 170,978 & $4.19\times$ & $4.52\times$ \\
+    \quad \code{-unsafe}, unrolled (\code{oxcaml_unsafe_unroll}) & 433,992 & $1.65\times$ & $1.78\times$ \\
+    \quad + hand s.r.\ (\code{oxcaml_unsafe_sr}) & 473,779 & $1.51\times$ & $1.63\times$ \\
+    \midrule
+    PR compiler, \code{-unsafe}, unrolled, passes off (\code{pr_off}) & 423,171 & $1.69\times$ & $1.82\times$ \\
+    \quad all passes + \code{-cmm-counted-loops} (\code{pr_counted}) & \textbf{553,383} & \textbf{$1.29\times$} & \textbf{$1.40\times$} \\
+    \quad + SSE2 kernel (\code{pr_simd_counted}) & 567,161 & $1.26\times$ & $1.36\times$ \\
+    \midrule
+    bounds checks kept: release, unrolled (\code{oxcaml_safe_unroll}) & 348,459 & $2.06\times$ & $2.22\times$ \\
+    \quad PR compiler, all passes + counted loops (\code{pr_safe_counted}) & 292,970 & $2.45\times$ & $2.64\times$ \\
+    \bottomrule
+  \end{tabularx}
+  \caption{The core configurations in run W (generation mode, median of 21
+  interleaved rounds; ratios are C++ throughput over the variant's; s.r.,
+  strength reduction). All rows but the first ports and the last two use
+  \code{-unsafe}; the headline is the scalar \code{pr_counted} row, and the
+  SSE2 row adds an explicitly vectorised kernel. Close builds can be ordered differently here than by
+  the paired comparisons, which are the reliable ones. Scoring mode agrees on
+  every difference larger than the resolution.}
+  \label{tab:final}
+\end{table}
+
+Beyond Table~\ref{tab:final}, paired comparisons settle three questions:
+
+\begin{itemize}
+  \item \textbf{Counted loops carry the gain:} $+16.6\%$ (21/21)
+        over the four passes with a poll on every back edge, and with the
+        passes $+30.2\%$ (21/21) over passes off
+        ($+31.0\%$ (21/21) in scoring mode), and
+        $+29.2\%$ (21/21) over the release; the price is
+        pause latency (Section~\ref{sec:counted}).
+  \item \textbf{The gain needs the pointer passes:} within counted mode they
+        are worth $+13.3\%$ (21/21); moving polls to loop exits
+        matters because it makes the pointers legal.
+  \item \textbf{Counted loops are as fast as poll-free code} within the run's
+        resolution, $+1.2\%$ to no polls at all
+        (Section~\ref{sec:last2}); unchecked loops and the other builds that
+        give up liveness gain no more than about the resolution
+        (Table~\ref{tab:liveness}).
+\end{itemize}
+
+\paragraph{With bounds checks kept.} Every OCaml figure above except the
+first ports uses \code{-unsafe}; Rust keeps its bounds checks and is
+$1.02\times$ behind C++. With checks kept, the pull request is
+\emph{slower} than the release: $-14.9\%$ (1/21) against
+bounds-checked OxCaml, $2.45\times$ behind C++, and
+$-47.2\%$ (0/21) against the counted build without checks.
+Interior pointers still form, but each check needs the row's index as well as
+its pointer: with eight values live instead of four, the allocator spills and
+reloads the four row pointers every iteration. I did not build a fix.
+
+\subsection{Does the Gap Survive a Wider Model?}
+\label{sec:width}
+microgpt's weights fit in the L1 data cache (Section~\ref{sec:model}). A
+sweep (a separate run, 21 interleaved rounds) widened the model, with no code
+change, to one layer, four heads and widths of 16 to 256, taking the weights
+through L2 (116\,KB--1.6\,MB) into L3 (6.4\,MB); all variants agree on every
+model's output. The wider models have random weights, which generate names
+about twice as long, so attention does more work per token; at width 16 that
+alone moves the counted build from $1.24\times$ to $1.42\times$ behind scalar
+C++. Widths are therefore compared among random models
+(Figure~\ref{fig:width}).
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{fig_width}
+  \caption{The gap to scalar C++ as the model widens (width-sweep run, one
+  layer, 21 rounds, median tokens/s). Lines are models with random weights;
+  the open markers are the trained width-16 model. The patched compiler with
+  counted loops polls at loop exits.}
+  \label{fig:width}
+\end{figure}
+
+With counted loops, OxCaml goes from $1.42\times$ behind scalar C++ at width
+16 to $1.32\times$ at 32, $1.26\times$ at 64, $1.16\times$ at 128 and
+$1.10\times$ at 256 (C++ won at least 20 of 21 rounds at every width); the
+5.2.0+ox release build stays $1.66$--$1.93\times$ behind. At widths 32--256
+counted loops gain $+46$ to $+51\%$ over that build and $+27$ to $+31\%$ over
+the four passes alone (paired medians, at least 20/21 rounds each).
+
+Why does the gap narrow? If memory is the cause, the ratio should narrow only
+when the weights stream from a slower level; if the shape is the cause
+(longer rows spreading each row's setup over more multiply--adds), it should
+narrow with matrix size even in cache. A separate micro-benchmark of the
+four-row kernel, with the weights reused (in cache) or cycled through 8\,MB
+(L3) or 64\,MB (main memory), decides it. The OCaml/C++ ratio falls from
+$1.19\times$ at $16\times16$ to $1.07$--$1.14\times$ at $256\times256$ and
+larger in cache, and no further from L3; only from main memory, which no
+model reaches, do the two converge. The narrowing therefore follows the loop
+shape: longer rows amortise the setup that Section~\ref{sec:residual} places
+outside the inner loop. GCC's vectoriser stays worth 8--10\% at every width,
+and Rust within 1--7\% of scalar C++.
+
+\subsection{In Words}
+Source-level work took OxCaml from $4.19\times$ to
+$1.65\times$ behind scalar C++. The compiler work, on unchanged
+source, closed more than half of the remaining gap, to $1.29\times$ with
+counted loops ($1.40\times$ behind vectorised C++).
+Figure~\ref{fig:matrix} shows every core build of run W.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{fig_matrix}
+  \caption{The core builds of run W (median of 21 interleaved rounds; Python,
+  6,479 tokens/s, is omitted). \texttt{oxcaml\_*} builds use the
+  5.4.0-ox7 release and \texttt{pr\_*} the pull-request compiler
+  (Section~\ref{sec:method}).}
+  \label{fig:matrix}
+\end{figure}

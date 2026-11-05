@@ -1,0 +1,96 @@
+From aa26c7e34e1eb4d39ad4986f528a58c6d9972f70 Mon Sep 17 00:00:00 2001
+From: local-rebase <local-rebase@localhost>
+Date: Fri, 30 Oct 2026 17:01:29 +0000
+Subject: [PATCH 19/24] 11-versioning-size-budget
+
+---
+ backend/cmm_strength_reduction.ml | 38 ++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index b9af2487ac..b8c74aa0a2 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -71,6 +71,12 @@ let iter_subexpressions f expr =
+        expr
+       : expression)
+ 
++(* The number of expression nodes in [expr], a measure of its code size. *)
++let rec node_count expr =
++  let n = ref 1 in
++  iter_subexpressions (fun sub -> n := !n + node_count sub) expr;
++  !n
++
+ (* Does [p] hold of [expr] or of any expression within it? *)
+ let rec exists_sub p expr =
+   p expr
+@@ -1895,6 +1901,11 @@ type fn =
+             all. *)
+     mutable found_counted : bool;
+         (** Some loop has lost its back-edge poll. *)
++    mutable versioning_budget : int;
++        (** How many more [Cmm] nodes the fallback copies of loops with an
++            entry check may add to the function. Each versioned loop of a
++            nest is copied with the versioned loops inside it, so without a
++            limit the code of a nest grows with the square of its depth. *)
+     mutable versioned_loops :
+       (Static_label.t * (expression * expression option)) list
+         (** Loops with an entry check, by the label of their poll-free
+@@ -2327,6 +2338,19 @@ let fresh_copy expr =
+   in
+   copy V.Map.empty expr
+ 
++(* The fallback copies of a function's versioned loops may add at most
++   [max versioning_floor (versioning_growth * size)] [Cmm] nodes, where [size]
++   is the function's own ([fn.versioning_budget]). Innermost loops are
++   versioned first, so a nest too deep for the budget keeps its inner levels
++   counted and its outer levels polled. The floor lets the small functions
++   that are a single nest version every level of a nest up to seven deep
++   (tests/gen_compile.py); beyond
++   that, or in a large function, growth is linear in the function's size
++   instead of quadratic in the nest's depth. *)
++let versioning_growth = 2
++
++let versioning_floor = 2000
++
+ (* [node] holds the poll-free loop [original.label] that the pipeline produced
+    from [original]. Add an exact copy of [original], polls included, and enter
+    the poll-free loop only where [pre] holds of the counter's entry value. *)
+@@ -2723,6 +2747,15 @@ let rec rewrite (config : config) int_vars expr =
+                     then pre, false
+                     else with_trip_cap ~dbg guard pre
+                   in
++                  let copy_size =
++                    match pre with
++                    | Check _ -> node_count original.body
++                    | Always | Never -> 0
++                  in
++                  if copy_size > fn.versioning_budget
++                  then decline "the fallback copy is over the size budget"
++                  else (
++                  fn.versioning_budget <- fn.versioning_budget - copy_size;
+                   report ~fn ~dbg
+                     (Printf.sprintf "counted, %s%s%s"
+                        (match pre with
+@@ -2734,7 +2767,7 @@ let rec rewrite (config : config) int_vars expr =
+                          Printf.sprintf " (%d inner check(s) lifted)"
+                            (List.length lifted))
+                        (if capped then " (trip cap)" else ""));
+-                  Some (original, handler, node, guard, pre)))
++                  Some (original, handler, node, guard, pre))))
+           | _, _ :: _ :: _ ->
+             report ~fn
+               ~dbg:(List.hd handlers).dbg
+@@ -2912,6 +2945,9 @@ let fundecl (fundecl : fundecl) =
+         unchecked_loops;
+         in_poll_error_function;
+         found_counted = false;
++        versioning_budget =
++          max versioning_floor
++            (versioning_growth * node_count fundecl.fun_body);
+         versioned_loops = []
+       }
+     in
+-- 
+2.47.3
+

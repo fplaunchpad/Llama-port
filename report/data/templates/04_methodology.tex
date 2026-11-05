@@ -1,0 +1,130 @@
+\section{Benchmark Methodology}
+\label{sec:method}
+
+\subsection{Machine}
+All experiments ran on a laptop with an Intel Core Ultra 7 155H (6 performance,
+8 efficiency and 2 low-power cores; AVX2), running a Debian environment under
+WSL2 on Windows~11. Performance is attributed with \code{rdtsc} region
+timers, instruction counts, disassembly and controlled experiments.
+
+\subsection{Getting Numbers One Can Trust}
+A hybrid CPU can move a long single-threaded job between core types and clock
+levels, so every measurement follows one protocol, after~\cite{georges2007rigorous,mytkowicz2009wrong}:
+
+\begin{enumerate}
+  \item \textbf{Equal time, not equal work.} A measurement runs the forward
+        pass repeatedly for 0.3\,s, three times in a fresh process, and keeps
+        the fastest.
+  \item \textbf{Pinning.} Every binary is pinned to one logical CPU
+        (\code{taskset -c 0}).
+  \item \textbf{Interleaved rounds.} Each of 21 rounds measures every variant
+        once, so slow drift affects all variants equally. Tables report the
+        median over rounds.
+  \item \textbf{Paired deltas.} An optimisation's effect is the median of its
+        per-round percentage change against the build it modifies, with the
+        rounds it won (``+12.2\%, 21/21'') and, where the effect is small, the
+        interquartile range.
+  \item \textbf{Correctness first.} Every variant passes the output gate of
+        Section~\ref{sec:contract} before any timing is accepted.
+\end{enumerate}
+
+Throughput is in tokens per second. \emph{Generation} mode, the default, times
+the forward passes that sample 200 names from a fixed seed; \emph{scoring}
+mode times those that compute the perplexity over the 14,307 held-out tokens.
+
+\subsection{One Run for Every microgpt Number}
+\label{sec:runu}
+Absolute throughput drifts by 10--20\% between days, so every microgpt
+throughput number in Sections~\ref{sec:stage1} to~\ref{sec:results} comes
+from \textbf{one run}, called run~W: 62 builds measured on 31 October 2026 on
+the same laptop, idle, after a five-minute settle, in 21 interleaved rounds in
+both modes, all with identical output.
+
+A typical variant's throughput varies by about 8\% between rounds
+(interquartile range), which is why every comparison is paired within rounds.
+As a built-in control, two byte-identical copies of one binary were measured
+as different variants. They differed by @D{pr_counted,pr_counted_copy}@
+(median of the per-round differences, interquartile range
+@I{pr_counted,pr_counted_copy}@, @W{pr_counted,pr_counted_copy}@ rounds), so
+differences between builds of less than about 3\% are treated as
+indistinguishable.
+
+\paragraph{Compilers.} The OxCaml release is 5.4.0-ox7 (opam
+\code{oxcaml-compiler.5.4.0-ox7}), configured as its opam recipe does
+(flambda2, poll insertion; Listing~\ref{lst:config}). The pull-request
+compiler is commit \code{91acf6b} of branch
+\code{ugrc2-rebased}~\cite{oxcaml_pr}: OxCaml main commit \code{327965f0e}
+(30 October 2026) plus the pull request's 24 patches, configured the same
+way. The series is also in the report's \code{data/pr-patches} directory; the
+pull request's page shows an earlier revision of it. Stock
+OCaml is 5.3.0 (commit \code{1ccb919}); \code{ocaml_pr_*} builds use it with
+the same passes ported (five commits, a separate series that is not part of
+the OxCaml pull request). Side results come from the previous release
+5.2.0+ox (\code{oxcaml52_*}) and from the one-compiler-per-pass ladder of
+Sections~\ref{sec:sr}--\ref{sec:stage6} (\code{ox54_*}), built on the
+September 2026 main branch without poll insertion.
+
+Table~\ref{tab:runs} lists the other experiments; each was made on the
+compiler of its time and predates the final rebase.
+
+\begin{table}[h]
+  \centering
+  \small
+  \begin{tabularx}{\textwidth}{@{}lXl@{}}
+    \toprule
+    run & what it measures & rounds \\
+    \midrule
+    W & every microgpt build (62 variants), both modes; Sections~\ref{sec:stage1}--\ref{sec:results} & 21 \\
+    regions & instrumented region profiles (Figure~\ref{fig:regions}) & 7 \\
+    width & microgpt widths 32--256; \code{linear} in and out of cache (Section~\ref{sec:width}) & 21 \\
+    nx & nx-oxcaml benchmarks (Sections~\ref{sec:nx-first} and~\ref{sec:counted}) & 13--21 \\
+    PolyBench & 17 PolyBench kernels in OCaml and C (Section~\ref{sec:polybench}) & 21 \\
+    crypto & ChaCha20 in oxcaml-crypto-study (Section~\ref{sec:crypto}) & 15 \\
+    kernels & eight-row and index-form kernels (Sections~\ref{sec:sr} and~\ref{sec:simd-why}) & 21 \\
+    layout & three builds at four code addresses (Section~\ref{sec:last2}) & 21 \\
+    latency & two-domain safepoint-latency tests, without and with a trip cap (Section~\ref{sec:counted}) & 3 \\
+    loops & inner loops timed alone, \code{llvm-mca} model (Section~\ref{sec:residual}) & 21 \\
+    micro & one-off single-loop experiments (\reg{r11} patch, unconditional LICM, isolated shapes, hand-written loops, attention) & varies \\
+    PR checks & final pull-request compiler: nx default flags, carried-value cap, trip-cap cost (Sections~\ref{sec:sr-pass} and~\ref{sec:counted}) & 15 \\
+    tests & upstream test suites in three modes, adversarial programs, OCaml 5.3.0 port (Sections~\ref{sec:counted} and~\ref{sec:stock}) & --- \\
+    \bottomrule
+  \end{tabularx}
+  \caption{Measurements behind the report, each with its own protocol. All
+  except run W and the last two rows predate the final rebase.}
+  \label{tab:runs}
+\end{table}
+
+\subsection{Variants and the Fair Baseline}
+Every optimisation is a build switch, not a source edit. Variant names give
+the language, safety (\code{safe} keeps bounds checks, \code{unsafe} uses
+\code{-unsafe}), kernel (\code{plain} or four-row \code{unroll}) and
+modifiers: \code{_sr} carries row indices by hand (Section~\ref{sec:sr});
+\code{_pollfree} uses \code{-disable-poll-insertion} and \code{_pollnop}
+overwrites the polls in the binary (Section~\ref{sec:polls}). \code{pr_*}
+builds use the pull-request compiler: \code{pr_off} has the passes off,
+\code{pr_all} the default flags (passes on, polls on every back edge), and
+\code{pr_counted} adds \code{-cmm-counted-loops}; the ladder
+\code{pr_c_off}, \code{pr_c_sr}, \code{pr_c_ip}, \code{pr_c_ivs} turns
+counted loops on first and then adds one pass at a time
+(Table~\ref{tab:passes}).
+
+Main tables and figures show a core set: the C++, Rust and Python ports,
+three stock OCaml builds, the source-level OxCaml stages on the release, the
+pull-request ladder and \code{pr_simd_counted}. Builds that give up liveness
+are shown apart (Table~\ref{tab:liveness}); others appear in the text.
+
+The shipped C++ build is auto-vectorised by GCC (two rows per SSE2 register,
+preserving each row's summation order); no OCaml variant vectorises until
+Section~\ref{sec:simd}. C++ compiled with \code{-fno-tree-vectorize}
+(\code{cpp_novec}) executes the same four scalar chains as the OCaml kernel:
+it is the \emph{fair baseline}. Gaps quoted as ``$n\times$'' are
+$\text{throughput}(\texttt{cpp\_novec}) / \text{throughput}(\text{OCaml variant})$
+unless stated otherwise.
+
+All code, build scripts and benchmark tools are in the project
+repository~\cite{llamaport_repo} at tag \code{ugrc2-report}, which fixes the
+sources of every port and variant. The report's \code{data} directory holds
+run~W's raw per-round results (\code{run_w_gen.txt}, \code{run_w_ppl.txt}),
+the scripts that built and timed it (\code{scripts/bench.py} with its variant
+registry \code{scripts/variants.py}), and those that derived every number
+(\code{analyse.py}, \code{fill.py}).

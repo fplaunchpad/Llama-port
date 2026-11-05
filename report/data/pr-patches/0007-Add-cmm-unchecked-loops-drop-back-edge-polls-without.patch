@@ -1,0 +1,298 @@
+From 35b2805ada3c84cc0b01e437655dc8fdf3217a48 Mon Sep 17 00:00:00 2001
+From: Aadi Srivastava <aadisrivastava.iitm@gmail.com>
+Date: Tue, 20 Oct 2026 05:54:10 +0000
+Subject: [PATCH 07/24] Add -cmm-unchecked-loops: drop back-edge polls without
+ a termination proof
+
+An opt-in variant of -cmm-counted-loops that trades liveness for coverage:
+every loop loses its back-edge poll whether or not it terminates, so a loop
+that never ends and never allocates or calls never polls. Loops with calls or
+allocations lose the back-edge poll too; they still poll at those points. Only
+GC-free loops get the pointer passes, since a derived pointer may not be live
+across a call or an allocation.
+
+One exception: a loop that executes Domain.cpu_relax or an atomic load keeps
+its poll. Such a loop waits for another domain, which may in turn be waiting
+for this one to join a stop-the-world collection; with poll insertion on,
+cpu_relax is a bare pause that relies on the back-edge poll. Without the
+exception a domain pool's completion spin-wait deadlocks.
+
+Also skip caml_apply* and caml_send* in both modes. Cfg_polling never polls
+them, so there is no poll to drop, and caml_send keeps a derived pointer live
+across its lookup loop: an exit poll there is a bad GC root.
+---
+ backend/cfg/cfg_polling.mli       |  3 +
+ backend/cmm_strength_reduction.ml | 98 +++++++++++++++++++++++++++++--
+ driver/oxcaml_args.ml             | 18 ++++++
+ driver/oxcaml_args.mli            |  2 +
+ driver/oxcaml_flags.ml            |  5 ++
+ driver/oxcaml_flags.mli           |  2 +
+ 6 files changed, 122 insertions(+), 6 deletions(-)
+
+diff --git a/backend/cfg/cfg_polling.mli b/backend/cfg/cfg_polling.mli
+index a297e3eed1..1ad0f22586 100644
+--- a/backend/cfg/cfg_polling.mli
++++ b/backend/cfg/cfg_polling.mli
+@@ -2,6 +2,9 @@
+ 
+ (** Analyses related to the insertion of [Poll] operations. *)
+ 
++(** [caml_apply*] and [caml_send*]: functions that never get a poll. *)
++val function_is_assumed_to_never_poll : string -> bool
++
+ val instrument_fundecl :
+   future_funcnames:Misc.Stdlib.String.Set.t ->
+   Cfg_with_layout.t ->
+diff --git a/backend/cmm_strength_reduction.ml b/backend/cmm_strength_reduction.ml
+index 257e397e95..7dab033343 100644
+--- a/backend/cmm_strength_reduction.ml
++++ b/backend/cmm_strength_reduction.ml
+@@ -555,6 +555,21 @@ let rec contains_polled_loop expr =
+       expr;
+     !found
+ 
++(* Does [expr] wait for another domain: spin on [Domain.cpu_relax] or read an
++   atomic? Such a loop ends only when another domain acts, and that domain may
++   itself be waiting for this one to poll -- to join a stop-the-world
++   collection -- so without its poll the two deadlock. With polling on,
++   [Domain.cpu_relax] is a bare [pause] that relies on the back-edge poll. *)
++let rec waits_for_other_domains expr =
++  match expr with
++  | Cop ((Cpause | Cload { is_atomic = true; _ }), _, _) -> true
++  | _ ->
++    let found = ref false in
++    iter_subexpressions
++      (fun sub -> if not !found then found := waits_for_other_domains sub)
++      expr;
++    !found
++
+ (* {2 Address expressions}
+ 
+    [{ root; scale; index; disp }] denotes [root + scale * index + disp]. At most
+@@ -1675,6 +1690,10 @@ let hoist_invariants ~duplicated ~int_vars ~relaxed ~counts ~expr =
+ 
+ let counted_loops_enabled = ref false
+ 
++(* -cmm-unchecked-loops: every loop that does not wait for another domain is
++   made poll-free, whether or not it terminates. *)
++let unchecked_loops_enabled = ref false
++
+ let found_counted = ref false
+ 
+ (* The [Clet] definitions of the whole function, for [range]. *)
+@@ -2368,7 +2387,11 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+          back-edge poll -- it polls on its exits instead -- so inside it the
+          passes run as they would on a unit compiled without polling. *)
+       let counted =
+-        if not (!counted_loops_enabled && not form_interior_pointers)
++        if
++          not
++            (!counted_loops_enabled
++            && (not !unchecked_loops_enabled)
++            && not form_interior_pointers)
+         then None
+         else
+           match expr, handlers with
+@@ -2413,9 +2436,60 @@ let rec rewrite ~duplicated ~strength_reduction ~form_interior_pointers
+             None
+           | _, _ -> None
+       in
+-      match counted with
+-      | None -> pipeline ~form_interior_pointers ~carry_pointers ~handlers expr
+-      | Some (original, handler, node, guard, pre) -> (
++      (* Without the termination proof every loop loses its back-edge poll
++         except one that waits for another domain, and gets the exit polls of
++         a counted loop. Only a GC-free loop with no polled loop inside is also
++         given the pointer passes: across a call, an allocation, or an inner
++         loop's poll, a derived pointer would be a bad GC root. A call or an
++         allocation still polls; a path through the loop that reaches neither
++         no longer does. *)
++      let unchecked =
++        if not (!unchecked_loops_enabled && not form_interior_pointers)
++        then None
++        else
++          match expr, handlers with
++          | Ccatch (_, _, entry), (first :: _ as handlers) ->
++            let dbg = first.dbg in
++            if waits_for_other_domains expr
++            then (
++              report ~dbg "keeps its poll: it waits for another domain";
++              None)
++            else
++              let pointer_passes =
++                is_gc_free expr
++                && (not (contains_polled_loop entry))
++                && not
++                     (List.exists
++                        (fun (handler : static_handler) ->
++                          contains_polled_loop handler.body)
++                        handlers)
++              in
++              report ~dbg
++                (if pointer_passes
++                 then "poll-free, termination not checked"
++                 else "poll-free, termination not checked, GC points inside");
++              Some
++                ( List.map
++                    (fun (handler : static_handler) ->
++                      { handler with is_bounded = true })
++                    handlers,
++                  entry,
++                  pointer_passes )
++          | _, _ -> None
++      in
++      match unchecked, counted with
++      | Some (handlers, entry, true), _ ->
++        found_counted := true;
++        pipeline ~gc_free:true ~form_interior_pointers:true ~carry_pointers:true
++          ~handlers
++          (Ccatch (Recursive, handlers, entry))
++      | Some (handlers, entry, false), _ ->
++        found_counted := true;
++        pipeline ~form_interior_pointers ~carry_pointers ~handlers
++          (Ccatch (Recursive, handlers, entry))
++      | None, None ->
++        pipeline ~form_interior_pointers ~carry_pointers ~handlers expr
++      | None, Some (original, handler, node, guard, pre) -> (
+         found_counted := true;
+         let fast = { handler with is_bounded = true } in
+         let expr =
+@@ -2457,6 +2531,16 @@ let polls_are_impossible (fundecl : fundecl) =
+   | Lambda.Error_poll -> true
+   | Lambda.Default_poll -> false
+ 
++(* Does [Cfg_polling] put polls in this function? Dropping a back-edge poll
++   needs one to drop, and the exit polls that replace it would be new
++   safepoints in a function such as [caml_send*], which keeps a derived pointer
++   live across its loop because it is never polled. *)
++let polls_are_inserted (fundecl : fundecl) =
++  (not (polls_are_impossible fundecl))
++  && not
++       (Cfg_polling.function_is_assumed_to_never_poll
++          fundecl.fun_name.sym_name)
++
+ let fundecl (fundecl : fundecl) =
+   let strength_reduction = !Oxcaml_flags.cmm_strength_reduction in
+   let form_interior_pointers =
+@@ -2475,15 +2559,17 @@ let fundecl (fundecl : fundecl) =
+   (* The proofs above are about 64-bit words, computed with a 64-bit host. *)
+   counted_loops_enabled
+     := !Oxcaml_flags.cmm_counted_loops
+-       && (not (polls_are_impossible fundecl))
++       && polls_are_inserted fundecl
+        && Arch.size_int = 8 && Nativeint.size = 64;
++  unchecked_loops_enabled
++    := !Oxcaml_flags.cmm_unchecked_loops && polls_are_inserted fundecl;
+   found_counted := false;
+   versioned_loops := [];
+   current_function := fundecl.fun_name.sym_name;
+   if
+     not
+       (strength_reduction || form_interior_pointers || licm
+-     || !counted_loops_enabled)
++     || !counted_loops_enabled || !unchecked_loops_enabled)
+   then fundecl
+   else
+     let params = List.map (fun (param, _) -> VP.var param) fundecl.fun_args in
+diff --git a/driver/oxcaml_args.ml b/driver/oxcaml_args.ml
+index 41efe33443..e5e69b4953 100644
+--- a/driver/oxcaml_args.ml
++++ b/driver/oxcaml_args.ml
+@@ -209,6 +209,17 @@ let mk_cmm_counted_loops f =
+     " Drop the back-edge poll of a GC-free loop that provably terminates, "
+     ^ "and poll once on its exits" )
+ 
++let mk_cmm_unchecked_loops f =
++  ( "-cmm-unchecked-loops",
++    Arg.Unit f,
++    " Drop the back-edge poll of every loop, terminating or not, except one "
++    ^ "that waits for another domain, and poll once on its exits" )
++
++let mk_no_cmm_unchecked_loops f =
++  ( "-no-cmm-unchecked-loops",
++    Arg.Unit f,
++    " Keep the back-edge poll of a loop not proved to terminate" )
++
+ let mk_dcounted_loops f =
+   ( "-dcounted-loops",
+     Arg.Unit f,
+@@ -1502,6 +1513,8 @@ module type Oxcaml_options = sig
+   val no_cmm_licm : unit -> unit
+   val cmm_counted_loops : unit -> unit
+   val no_cmm_counted_loops : unit -> unit
++  val cmm_unchecked_loops : unit -> unit
++  val no_cmm_unchecked_loops : unit -> unit
+   val dcounted_loops : unit -> unit
+   val cfg_stack_checks : unit -> unit
+   val no_cfg_stack_checks : unit -> unit
+@@ -1730,6 +1743,8 @@ module Make_oxcaml_options (F : Oxcaml_options) = struct
+       mk_no_cmm_licm F.no_cmm_licm;
+       mk_cmm_counted_loops F.cmm_counted_loops;
+       mk_no_cmm_counted_loops F.no_cmm_counted_loops;
++      mk_cmm_unchecked_loops F.cmm_unchecked_loops;
++      mk_no_cmm_unchecked_loops F.no_cmm_unchecked_loops;
+       mk_dcounted_loops F.dcounted_loops;
+       mk_cfg_stack_checks F.cfg_stack_checks;
+       mk_no_cfg_stack_checks F.no_cfg_stack_checks;
+@@ -2114,6 +2129,8 @@ module Oxcaml_options_impl = struct
+   let no_cmm_licm = clear' Oxcaml_flags.cmm_licm
+   let cmm_counted_loops = set' Oxcaml_flags.cmm_counted_loops
+   let no_cmm_counted_loops = clear' Oxcaml_flags.cmm_counted_loops
++  let cmm_unchecked_loops = set' Oxcaml_flags.cmm_unchecked_loops
++  let no_cmm_unchecked_loops = clear' Oxcaml_flags.cmm_unchecked_loops
+   let dcounted_loops = set' Oxcaml_flags.dump_counted_loops
+   let cfg_stack_checks = set' Oxcaml_flags.cfg_stack_checks
+   let no_cfg_stack_checks = clear' Oxcaml_flags.cfg_stack_checks
+@@ -2747,6 +2764,7 @@ module Extra_params = struct
+     | "cmm-carried-pointers" -> set' Oxcaml_flags.cmm_carried_pointers
+     | "cmm-licm" -> set' Oxcaml_flags.cmm_licm
+     | "cmm-counted-loops" -> set' Oxcaml_flags.cmm_counted_loops
++    | "cmm-unchecked-loops" -> set' Oxcaml_flags.cmm_unchecked_loops
+     | "cfg-stack-checks" -> set' Oxcaml_flags.cfg_stack_checks
+     | "cfg-eliminate-dead-trap-handlers" ->
+         set' Oxcaml_flags.cfg_eliminate_dead_trap_handlers
+diff --git a/driver/oxcaml_args.mli b/driver/oxcaml_args.mli
+index fee0ee84fb..f62a6eb7de 100644
+--- a/driver/oxcaml_args.mli
++++ b/driver/oxcaml_args.mli
+@@ -63,6 +63,8 @@ module type Oxcaml_options = sig
+   val no_cmm_licm : unit -> unit
+   val cmm_counted_loops : unit -> unit
+   val no_cmm_counted_loops : unit -> unit
++  val cmm_unchecked_loops : unit -> unit
++  val no_cmm_unchecked_loops : unit -> unit
+   val dcounted_loops : unit -> unit
+   val cfg_stack_checks : unit -> unit
+   val no_cfg_stack_checks : unit -> unit
+diff --git a/driver/oxcaml_flags.ml b/driver/oxcaml_flags.ml
+index ff879665a8..e682eed5f5 100644
+--- a/driver/oxcaml_flags.ml
++++ b/driver/oxcaml_flags.ml
+@@ -52,6 +52,11 @@ let cmm_licm = ref true                 (* -[no-]cmm-licm *)
+    testsuite has been run with them. See cmm_strength_reduction.ml. *)
+ let cmm_counted_loops = ref false       (* -[no-]cmm-counted-loops *)
+ 
++(* The same without the termination proof: every loop loses its back-edge
++   poll unless it waits for another domain, so one that never ends and never
++   allocates or calls never polls. *)
++let cmm_unchecked_loops = ref false     (* -[no-]cmm-unchecked-loops *)
++
+ let dump_counted_loops = ref false      (* -dcounted-loops *)
+ 
+ let cfg_stack_checks = ref true         (* -[no-]cfg-stack-check *)
+diff --git a/driver/oxcaml_flags.mli b/driver/oxcaml_flags.mli
+index 4f8c99e345..9aeb795f2f 100644
+--- a/driver/oxcaml_flags.mli
++++ b/driver/oxcaml_flags.mli
+@@ -51,6 +51,8 @@ val cmm_licm : bool ref
+ 
+ val cmm_counted_loops : bool ref
+ 
++val cmm_unchecked_loops : bool ref
++
+ val dump_counted_loops : bool ref
+ 
+ val cfg_stack_checks : bool ref
+-- 
+2.47.3
+
